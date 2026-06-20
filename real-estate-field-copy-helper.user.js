@@ -23,6 +23,18 @@
     "礼金：{keyMoney}",
     "入居日：{moveInDate}",
   ].join("\n");
+  const DEFAULT_HTML_CELL_OUTPUT_TEMPLATE = [
+    "<td class=\"plan_td02\">{layout}</td>",
+    "<td class=\"plan_td02\">{area}</td>",
+    "<td class=\"plan_td02\">\\{rent}</td>",
+    "<td class=\"plan_td02\">\\{managementFee}</td>",
+    "<td class=\"plan_td02\">{deposit}/{keyMoney}</td>",
+    "<td class=\"plan_td02\">{availableDate}</td>",
+  ].join("\n");
+  const DEFAULT_COPY_TEMPLATES = [
+    { name: "コピー文面①", template: DEFAULT_OUTPUT_TEMPLATE },
+    { name: "コピー文面②", template: DEFAULT_HTML_CELL_OUTPUT_TEMPLATE },
+  ];
   const DEFAULT_VALUE_ALIASES = [
     { output: "即可", aliases: ["即入居可", "即入居", "即時入居可", "すぐ入居可"] },
     { output: "0ヶ月", aliases: ["", "なし", "無し", "無", "無料", "不要", "-"] },
@@ -30,6 +42,8 @@
   const DEFAULT_PANEL_WIDTH = 760;
   const DEFAULT_PANEL_HEIGHT = 620;
   const PANEL_VIEW_GAP = 8;
+  const AI_PREVIEW_ROW_LIMIT = 500;
+  const DUPLICATE_WARNING_DISMISS_MS = 24 * 60 * 60 * 1000;
 
   const DEFAULT_FIELD_DEFS = [
     {
@@ -195,6 +209,7 @@
       derivedFields: [],
       listingExtractor: createDefaultListingExtractor(),
       outputTemplate: DEFAULT_OUTPUT_TEMPLATE,
+      outputTemplates: DEFAULT_COPY_TEMPLATES.map((template) => ({ ...template })),
       createdAt: now,
       updatedAt: now,
     };
@@ -211,6 +226,7 @@
         includeBeforeContent: false,
         includeAfterContent: false,
       },
+      tableExtraction: createDefaultTableExtraction(),
       outputColumns: [
         { key: "buildingName", label: "物件名" },
         { key: "room", label: "号室" },
@@ -224,6 +240,22 @@
         { key: "area", label: "面積" },
       ],
       fields: createDefaultListingFields(),
+    };
+  }
+
+  function createDefaultTableExtraction() {
+    return {
+      enabled: false,
+      mode: "standard",
+      tableSelector: "",
+      rowSelector: "tr",
+      cellSelector: "td,th",
+      headerRowIndex: 0,
+      dataStartRowIndex: 1,
+      roomSelector: "",
+      buildingNameSelector: "",
+      columns: {},
+      excludeColumns: [],
     };
   }
 
@@ -301,6 +333,66 @@
     }
   }
 
+  function appendAiAssistantLog(action, rawJson, report, extra) {
+    try {
+      const raw = getStoredValue(SETTINGS_KEY, "");
+      const persisted = raw ? migrateSettingsIfNeeded(typeof raw === "string" ? JSON.parse(raw) : raw) : clonePlain(settings);
+      const logs = Array.isArray(persisted.aiAssistantLogs) ? persisted.aiAssistantLogs.slice() : [];
+      logs.unshift(createAiAssistantLogEntry(action, rawJson, report, extra));
+      persisted.aiAssistantLogs = logs.slice(0, 40);
+      persisted.version = SETTINGS_VERSION;
+      setStoredValue(SETTINGS_KEY, JSON.stringify(persisted));
+      settings.aiAssistantLogs = persisted.aiAssistantLogs;
+    } catch (error) {
+      console.warn("[RealEstateCopyHelper] AI補助ログの保存に失敗しました", error);
+    }
+  }
+
+  function createAiAssistantLogEntry(action, rawJson, report, extra) {
+    const context = getCurrentUrlContext();
+    return {
+      id: `ai-log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      createdAt: new Date().toISOString(),
+      action,
+      page: {
+        hostname: context.hostname,
+        pathname: context.pathname,
+        title: context.title,
+      },
+      rawJson: truncateText(String(rawJson || ""), 80000),
+      jsonObjectText: safeExtractJsonObjectText(rawJson),
+      report: summarizeAiReportForLog(report),
+      ...(extra && typeof extra === "object" ? extra : {}),
+    };
+  }
+
+  function summarizeAiReportForLog(report) {
+    if (!report) return null;
+    return {
+      applied: report.applied || 0,
+      aiRound: report.aiRound || 0,
+      rowCount: report.rowCount || 0,
+      previewRowCount: report.previewRowCount || 0,
+      previewRowTotal: report.previewRowTotal || report.rowCount || 0,
+      itemCount: report.itemCount || 0,
+      roomCount: report.roomCount || 0,
+      errors: (report.errors || []).slice(0, 30),
+      warnings: (report.warnings || []).slice(0, 30),
+      retryFieldKeys: Array.isArray(report.retryFieldKeys) ? report.retryFieldKeys.slice() : [],
+      fieldScores: (report.fieldScores || []).map((score) => ({
+        key: score.key,
+        label: score.label,
+        score: score.score,
+        retrieved: `${score.valueCount}/${score.contextCount}`,
+        formatOk: score.requiresFormat ? `${score.formatOkCount}/${score.valueCount || 0}` : "-",
+        samples: score.samples || [],
+        rawSamples: score.rawSamples || [],
+        issueReasons: score.issueReasons || [],
+        currentRule: score.currentRule || null,
+      })),
+    };
+  }
+
   function addSettingsBackupBeforeSave(nextSettings) {
     try {
       const raw = getStoredValue(SETTINGS_KEY, "");
@@ -345,6 +437,7 @@
     if (!Array.isArray(migrated.profiles)) migrated.profiles = [];
     migrated.profiles.forEach((profile) => {
       if (profile && !profile.listingExtractor) profile.listingExtractor = createDefaultListingExtractor();
+      if (profile) ensureProfileOutputTemplates(profile);
       if (profile) clearDefaultSingleFieldRules(profile);
       if (profile && profile.listingExtractor && profile.listingExtractor.uiManagedRules !== true) {
         clearListingFieldRules(profile.listingExtractor);
@@ -355,6 +448,7 @@
     });
     if (!Array.isArray(migrated.globalOutputTemplates)) migrated.globalOutputTemplates = [];
     if (!Array.isArray(migrated.settingsBackups)) migrated.settingsBackups = [];
+    if (!Array.isArray(migrated.aiAssistantLogs)) migrated.aiAssistantLogs = [];
     if (!Array.isArray(migrated.globalValueAliases)) {
       migrated.globalValueAliases = DEFAULT_VALUE_ALIASES.map((rule) => ({ output: rule.output, aliases: rule.aliases.slice() }));
     }
@@ -391,7 +485,41 @@
     if (!migrated.uiSettings.panelTableSort || typeof migrated.uiSettings.panelTableSort !== "object") {
       migrated.uiSettings.panelTableSort = {};
     }
+    if (migrated.uiSettings.panelTableValueMode !== "raw") {
+      migrated.uiSettings.panelTableValueMode = "normalized";
+    }
+    if (!Number.isFinite(migrated.uiSettings.duplicateWarningDismissedUntil)) {
+      migrated.uiSettings.duplicateWarningDismissedUntil = 0;
+    }
     return migrated;
+  }
+
+  function ensureProfileOutputTemplates(profile) {
+    if (!profile || typeof profile !== "object") return;
+    const existing = Array.isArray(profile.outputTemplates) ? profile.outputTemplates : [];
+    const normalized = existing
+      .filter((entry) => entry && typeof entry === "object")
+      .map((entry, index) => ({
+        name: String(entry.name || `コピー文面${index + 1}`).trim() || `コピー文面${index + 1}`,
+        template: String(entry.template || ""),
+      }))
+      .filter((entry) => entry.template);
+    if (!normalized.length) {
+      normalized.push({
+        name: "コピー文面①",
+        template: String(profile.outputTemplate || DEFAULT_OUTPUT_TEMPLATE),
+      });
+    }
+    if (!normalized.some((entry) => entry.name === "コピー文面②" || entry.template === DEFAULT_HTML_CELL_OUTPUT_TEMPLATE)) {
+      normalized.push({ name: "コピー文面②", template: DEFAULT_HTML_CELL_OUTPUT_TEMPLATE });
+    }
+    profile.outputTemplates = normalized;
+    profile.outputTemplate = normalized[0] ? normalized[0].template : DEFAULT_OUTPUT_TEMPLATE;
+  }
+
+  function getProfileOutputTemplates(profile) {
+    ensureProfileOutputTemplates(profile);
+    return Array.isArray(profile && profile.outputTemplates) ? profile.outputTemplates : DEFAULT_COPY_TEMPLATES;
   }
 
   function getStoredValue(key, fallbackValue) {
@@ -528,6 +656,9 @@
         anomalySlot.appendChild(renderListingAnomalyWarnings(filteredListingRows));
         updatePanelListingStatus(status, listingRows, filteredListingRows);
       }));
+      panelRoot.appendChild(renderPanelValueModeToggle(() => {
+        renderPanel();
+      }));
     }
 
     if (activeTab === "settings") {
@@ -606,6 +737,7 @@
     details.appendChild(summary);
     const menu = el("div", "rech-placement-popover");
     [
+      ["全画面", () => placePanelFullscreen()],
       ["左1/2", () => placePanelHalf("left")],
       ["右1/2", () => placePanelHalf("right")],
       ["横全", () => placePanelWidth("full")],
@@ -787,6 +919,11 @@
     applyPanelPlacement(width, height, left, PANEL_VIEW_GAP);
   }
 
+  function placePanelFullscreen() {
+    if (!panelRoot) return;
+    applyPanelPlacement(getMaxPanelWidth(), getMaxPanelHeight(), PANEL_VIEW_GAP, PANEL_VIEW_GAP);
+  }
+
   function placePanelHeight(mode) {
     if (!panelRoot) return;
     const rect = panelRoot.getBoundingClientRect();
@@ -858,13 +995,58 @@
     return {
       sortable: true,
       sortState: getPanelTableSort(),
+      valueMode: getPanelTableValueMode(),
       onSort: (key) => {
         togglePanelTableSort(key);
         renderPanel();
       },
       directFieldPick: true,
       onPickField: startListingFieldPickerFromTable,
+      rowCopyTemplates: getProfileOutputTemplates(activeProfile),
+      onCopyRowTemplate: copyListingRowWithTemplate,
     };
+  }
+
+  function renderPanelValueModeToggle(onChange) {
+    const wrapper = el("div", "rech-value-mode-toggle");
+    wrapper.appendChild(el("span", "", "表示"));
+    [
+      ["normalized", "整形後"],
+      ["raw", "取得元"],
+    ].forEach(([mode, label]) => {
+      const modeButton = button(label, `rech-secondary rech-mini-button${getPanelTableValueMode() === mode ? " is-active" : ""}`, () => {
+        settings.uiSettings.panelTableValueMode = mode;
+        saveUiSettingsOnly();
+        if (typeof onChange === "function") onChange();
+      });
+      modeButton.type = "button";
+      modeButton.setAttribute("aria-pressed", getPanelTableValueMode() === mode ? "true" : "false");
+      modeButton.title = mode === "raw" ? "正規化前に取得した表示へ切り替えます" : "表記ゆれを吸収した表示へ戻します";
+      wrapper.appendChild(modeButton);
+    });
+    wrapper.appendChild(el("small", "", getPanelTableValueMode() === "raw" ? "取得元表示です。正規化や切り出し前の値を確認できます。" : "整形後表示です。コピーに使う値を確認できます。"));
+    return wrapper;
+  }
+
+  function getPanelTableValueMode() {
+    return settings.uiSettings && settings.uiSettings.panelTableValueMode === "raw" ? "raw" : "normalized";
+  }
+
+  async function copyListingRowWithTemplate(row, templateEntry) {
+    try {
+      const template = templateEntry && templateEntry.template || DEFAULT_OUTPUT_TEMPLATE;
+      const text = buildOutputText(createOutputValuesForRow(row, { htmlCell: isHtmlCellOutputTemplate(template) }), template);
+      await copyToClipboard(text);
+      showToast(`${templateEntry && templateEntry.name || "コピー文面"}をコピーしました`, "success");
+    } catch (error) {
+      console.warn("[RealEstateCopyHelper] 部屋単位コピーに失敗しました", error);
+      showToast("コピーに失敗しました", "error");
+    }
+  }
+
+  function isHtmlCellOutputTemplate(template) {
+    const text = String(template || "");
+    return text.includes("<td") || text.includes("plan_td02");
   }
 
   function startListingFieldPickerFromTable(fieldKey) {
@@ -1063,7 +1245,18 @@
       box.hidden = true;
       return box;
     }
-    warnings.forEach((warning) => box.appendChild(el("div", "", warning)));
+    warnings.forEach((warning) => {
+      const row = el("div", "rech-anomaly-warning-row");
+      row.appendChild(el("span", "", warning.message));
+      if (warning.key === "duplicates") {
+        row.appendChild(button("閉じる", "rech-secondary rech-mini-button rech-anomaly-close", () => {
+          settings.uiSettings.duplicateWarningDismissedUntil = Date.now() + DUPLICATE_WARNING_DISMISS_MS;
+          saveUiSettingsOnly();
+          box.remove();
+        }));
+      }
+      box.appendChild(row);
+    });
     return box;
   }
 
@@ -1072,7 +1265,7 @@
     if (list.length < 2) return [];
     const warnings = [];
     const duplicateCount = list.reduce((count, row) => count + ((row && row._duplicates && row._duplicates.length) || 0), 0);
-    if (duplicateCount) warnings.push(`重複候補が${duplicateCount}件あります。#列の「重複候補」を開いて確認してください。`);
+    if (duplicateCount && !isDuplicateWarningDismissed()) warnings.push({ key: "duplicates", message: `重複候補が${duplicateCount}件あります。#列の「重複候補」を開いて確認してください。` });
     [
       ["rent", "賃料"],
       ["layout", "間取り"],
@@ -1081,7 +1274,7 @@
     ].forEach(([key, label]) => {
       const values = list.map((row) => normalizeText(row && row[key] || "")).filter(Boolean);
       if (values.length >= Math.min(3, list.length) && new Set(values).size === 1) {
-        warnings.push(`${label}が全行で同じです。1件目の値を繰り返し取得していないか確認してください。`);
+        warnings.push({ key: `same-${key}`, message: `${label}が全行で同じです。1件目の値を繰り返し取得していないか確認してください。` });
       }
     });
     [
@@ -1090,9 +1283,14 @@
       ["area", "面積"],
     ].forEach(([key, label]) => {
       const emptyCount = list.filter((row) => !normalizeText(row && row[key] || "")).length;
-      if (emptyCount && emptyCount / list.length >= 0.5) warnings.push(`${label}が${emptyCount}/${list.length}件で空欄です。`);
+      if (emptyCount && emptyCount / list.length >= 0.5) warnings.push({ key: `empty-${key}`, message: `${label}が${emptyCount}/${list.length}件で空欄です。` });
     });
     return warnings.slice(0, 5);
+  }
+
+  function isDuplicateWarningDismissed() {
+    const until = settings.uiSettings && Number(settings.uiSettings.duplicateWarningDismissedUntil);
+    return Number.isFinite(until) && until > Date.now();
   }
 
   function openListingTableInNewTab(rows) {
@@ -1103,13 +1301,15 @@
     }
     const title = `${activeProfile && activeProfile.name || "物件確認"} テーブル`;
     popup.document.open();
-    popup.document.write(buildListingTableStandaloneHtml(rows, title));
+    popup.document.write(buildListingTableStandaloneHtml(rows, title, getPanelTableSort()));
     popup.document.close();
   }
 
-  function buildListingTableStandaloneHtml(rows, title) {
+  function buildListingTableStandaloneHtml(rows, title, initialSortState) {
     const columns = [["index", "#"], ...getListingOutputColumns().filter(([key]) => key !== "url")];
     const warnings = getListingAnomalyWarnings(rows);
+    const tableData = buildStandaloneListingTableData(rows, columns);
+    const sortState = initialSortState && initialSortState.key ? initialSortState : { key: "", direction: "asc" };
     return [
       "<!doctype html>",
       "<html lang=\"ja\">",
@@ -1124,28 +1324,148 @@
       ".table-wrap{overflow:auto;border:1px solid #cbd5df;border-radius:7px;background:#fff;}",
       "table{width:100%;border-collapse:collapse;font-size:13px;}",
       "th,td{padding:7px 8px;border-bottom:1px solid #e5edf4;border-right:1px solid #eef2f7;text-align:left;white-space:nowrap;}",
-      "th{position:sticky;top:0;background:#eef2f7;z-index:1;font-weight:700;}",
-      "tr:nth-child(even) td{background:#fbfdff;}",
+      "th{position:sticky;top:0;background:#dbe4ee;z-index:1;font-weight:700;}",
+      "th.is-sorted{background:#dbeafe;}",
+      ".sort-button{appearance:none;width:100%;margin:0;padding:0;border:0;background:transparent;color:inherit;font:inherit;font-weight:700;text-align:left;cursor:pointer;white-space:nowrap;}",
+      ".sort-button:hover{text-decoration:underline;}",
+      "tr:nth-child(even) td{background:#f6f7f9;}",
       "a{color:#1f6feb;text-decoration:underline;}",
       "</style>",
       "</head>",
       "<body>",
       `<h1>${escapeHtml(title)}</h1>`,
       `<p class=\"meta\">${rows.length}件 / ${escapeHtml(new Date().toLocaleString("ja-JP"))}</p>`,
-      warnings.length ? `<div class=\"warnings\">${warnings.map(escapeHtml).join("<br>")}</div>` : "",
+      warnings.length ? `<div class=\"warnings\">${warnings.map((warning) => escapeHtml(warning.message || warning)).join("<br>")}</div>` : "",
       "<div class=\"table-wrap\"><table><thead><tr>",
-      columns.map(([, label]) => `<th>${escapeHtml(label)}</th>`).join(""),
-      "</tr></thead><tbody>",
-      rows.map((row, rowIndex) => `<tr>${columns.map(([key]) => {
-        const value = key === "index" ? String(rowIndex + 1) : key === "propertyName" ? row.propertyName || row.buildingName || "" : row[key] || "";
-        if (key === "propertyName" && row.url) {
-          return `<td><a href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">${escapeHtml(value)}</a></td>`;
-        }
-        return `<td>${escapeHtml(value)}</td>`;
-      }).join("")}</tr>`).join(""),
+      columns.map(([key, label]) => `<th data-key="${escapeHtml(key)}"><button class="sort-button" type="button" data-key="${escapeHtml(key)}">${escapeHtml(label)} ⇅</button></th>`).join(""),
+      "</tr></thead><tbody id=\"listing-table-body\">",
+      tableData.rows.map((row, rowIndex) => renderStandaloneListingTableRow(row, columns, rowIndex)).join(""),
       "</tbody></table></div>",
+      "<script>",
+      `window.__RECH_TABLE__=${safeInlineJson({ columns: tableData.columns, rows: tableData.rows, sortState })};`,
+      standaloneListingTableScript(),
+      "</script>",
       "</body></html>",
     ].join("");
+  }
+
+  function buildStandaloneListingTableData(rows, columns) {
+    return {
+      columns,
+      rows: rows.map((row, rowIndex) => {
+        const cells = {};
+        const sortValues = {};
+        columns.forEach(([key]) => {
+          const value = key === "index" ? String(rowIndex + 1) : key === "propertyName" ? row.propertyName || row.buildingName || "" : row[key] || "";
+          cells[key] = value;
+          if (key === "index") {
+            sortValues[key] = { empty: false, type: "number", value: Number(row.index || rowIndex + 1) };
+          } else {
+            sortValues[key] = getSortableListingValue(row, key);
+          }
+        });
+        return {
+          cells,
+          sortValues,
+          url: row.url || "",
+          originalIndex: rowIndex,
+        };
+      }),
+    };
+  }
+
+  function renderStandaloneListingTableRow(row, columns, rowIndex) {
+    return `<tr>${columns.map(([key]) => {
+      const value = key === "index" ? String(rowIndex + 1) : row.cells[key] || "";
+      if (key === "propertyName" && row.url) {
+        return `<td><a href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">${escapeHtml(value)}</a></td>`;
+      }
+      return `<td>${escapeHtml(value)}</td>`;
+    }).join("")}</tr>`;
+  }
+
+  function safeInlineJson(value) {
+    return JSON.stringify(value)
+      .replace(/</g, "\\u003c")
+      .replace(/>/g, "\\u003e")
+      .replace(/&/g, "\\u0026")
+      .replace(/\u2028/g, "\\u2028")
+      .replace(/\u2029/g, "\\u2029");
+  }
+
+  function standaloneListingTableScript() {
+    return `
+(function(){
+  var state = window.__RECH_TABLE__ || { columns: [], rows: [], sortState: { key: "", direction: "asc" } };
+  var columns = state.columns || [];
+  var rows = (state.rows || []).slice();
+  var sortState = state.sortState || { key: "", direction: "asc" };
+  var tbody = document.getElementById("listing-table-body");
+  function escapeHtml(value) {
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+  function compareRows(a, b, key) {
+    var left = a.sortValues && a.sortValues[key] || { empty: true, type: "text", value: "" };
+    var right = b.sortValues && b.sortValues[key] || { empty: true, type: "text", value: "" };
+    if (left.empty && right.empty) return 0;
+    if (left.empty) return 1;
+    if (right.empty) return -1;
+    if (left.type === "number" && right.type === "number") return Number(left.value || 0) - Number(right.value || 0);
+    return String(left.value || "").localeCompare(String(right.value || ""), "ja", { numeric: true, sensitivity: "base" });
+  }
+  function getSortedRows() {
+    if (!sortState.key) return rows.slice();
+    var direction = sortState.direction === "desc" ? -1 : 1;
+    return rows.map(function(row, index){ return { row: row, index: index }; })
+      .sort(function(a, b){
+        var compared = compareRows(a.row, b.row, sortState.key);
+        return compared ? compared * direction : a.row.originalIndex - b.row.originalIndex || a.index - b.index;
+      })
+      .map(function(entry){ return entry.row; });
+  }
+  function renderRows() {
+    if (!tbody) return;
+    tbody.innerHTML = getSortedRows().map(function(row, rowIndex){
+      return "<tr>" + columns.map(function(column){
+        var key = column[0];
+        var value = key === "index" ? String(rowIndex + 1) : row.cells && row.cells[key] || "";
+        if (key === "propertyName" && row.url) {
+          return '<td><a href="' + escapeHtml(row.url) + '" target="_blank" rel="noreferrer">' + escapeHtml(value) + "</a></td>";
+        }
+        return "<td>" + escapeHtml(value) + "</td>";
+      }).join("") + "</tr>";
+    }).join("");
+  }
+  function renderHeaders() {
+    document.querySelectorAll(".sort-button").forEach(function(button){
+      var key = button.getAttribute("data-key") || "";
+      var column = columns.find(function(candidate){ return candidate[0] === key; });
+      var label = column ? column[1] : key;
+      button.textContent = sortState.key === key ? label + " " + (sortState.direction === "desc" ? "↓" : "↑") : label + " ⇅";
+      button.setAttribute("aria-sort", sortState.key === key ? (sortState.direction === "desc" ? "descending" : "ascending") : "none");
+      var th = button.closest("th");
+      if (th) th.classList.toggle("is-sorted", sortState.key === key);
+    });
+  }
+  document.querySelectorAll(".sort-button").forEach(function(button){
+    button.addEventListener("click", function(){
+      var key = button.getAttribute("data-key") || "";
+      sortState = {
+        key: key,
+        direction: sortState.key === key && sortState.direction === "asc" ? "desc" : "asc"
+      };
+      renderHeaders();
+      renderRows();
+    });
+  });
+  renderHeaders();
+  renderRows();
+})();`;
   }
 
   function startPanelDrag(event, options) {
@@ -1451,9 +1771,7 @@
       activeProfile.match.pathPattern = value.trim();
     }, "空欄ならこのサイトの全ページで使います。例: /jj/chintai/*", "同じサイト内で、この設定を使うページを絞るための条件です。普通は空欄で構いません。複数の一覧ページで設定を分けたい時だけ、URLの / 以降を入れます。* は任意の文字として扱います。"));
     profileSection.appendChild(renderProfileMatchExplanation(activeProfile));
-    profileSection.appendChild(labeledTextarea("コピー文面", activeProfile.outputTemplate || DEFAULT_OUTPUT_TEMPLATE, (value) => {
-      activeProfile.outputTemplate = value;
-    }, "物件詳細画面からコピーするときの文面です。検索結果の表コピーとは別です。", "物件詳細画面で1物件分をコピーするときの文章形式です。{rent} のような項目名が、取得した値に置き換わります。"));
+    profileSection.appendChild(renderOutputTemplatesEditor(activeProfile));
     const profileActions = el("div", "rech-inline-actions");
     profileActions.appendChild(button("この設定を複製", "rech-secondary", () => {
       activeProfile = duplicateProfile(activeProfile);
@@ -1589,11 +1907,10 @@
     overlay.appendChild(modal);
     overlay.addEventListener("click", (event) => {
       if (event.target !== overlay) return;
-      if (settingsDirty) {
-        showToast("未保存です。保存して戻るか、保存せず戻るを押してください", "error");
-        return;
-      }
-      closeSettingsModal({ discard: true });
+      event.preventDefault();
+      event.stopPropagation();
+      nudgeSettingsModal(modal);
+      showToast("外側クリックでは閉じません。保存して戻るか、保存せず戻るを押してください", "error");
     });
     document.documentElement.appendChild(overlay);
     positionSettingsModal(modal, panelRect);
@@ -1606,6 +1923,16 @@
     if (!assistant) return;
     assistant.open = true;
     assistant.scrollIntoView({ block: "start", inline: "nearest" });
+  }
+
+  function nudgeSettingsModal(modal) {
+    if (!modal) return;
+    modal.classList.remove("is-attention");
+    void modal.offsetWidth;
+    modal.classList.add("is-attention");
+    window.setTimeout(() => {
+      if (modal && modal.classList) modal.classList.remove("is-attention");
+    }, 320);
   }
 
   function focusListingFieldEditor(modal, fieldKey) {
@@ -1633,6 +1960,61 @@
     box.appendChild(el("small", "", `今のページ: ${context.hostname}${context.pathname}`));
     box.appendChild(el("small", "", "通常は「この設定を使うサイト」はそのまま、「この設定を使うページ」は空欄で問題ありません。"));
     return box;
+  }
+
+  function renderOutputTemplatesEditor(profile) {
+    ensureProfileOutputTemplates(profile);
+    const wrapper = el("div", "rech-output-templates");
+    wrapper.appendChild(termWithHelp("コピー文面", "物件詳細画面や部屋行からコピーするときの文面です。複数登録できます。{rent} のような項目名が取得値に置き換わります。"));
+    wrapper.appendChild(el("small", "rech-output-template-note", "コピー文面②には、空室表HTMLへ貼り戻すための td 形式を初期登録しています。"));
+    const list = el("div", "rech-output-template-list");
+    const renderList = () => {
+      list.innerHTML = "";
+      getProfileOutputTemplates(profile).forEach((entry, index) => {
+        const item = el("div", "rech-output-template-item");
+        const header = el("div", "rech-output-template-header");
+        const nameInput = document.createElement("input");
+        nameInput.type = "text";
+        nameInput.value = entry.name || `コピー文面${index + 1}`;
+        nameInput.addEventListener("input", () => {
+          entry.name = nameInput.value.trim() || `コピー文面${index + 1}`;
+          markSettingsDirty("未保存");
+        });
+        header.appendChild(nameInput);
+        if (index > 0) {
+          header.appendChild(button("削除", "rech-secondary rech-mini-button", () => {
+            profile.outputTemplates.splice(index, 1);
+            ensureProfileOutputTemplates(profile);
+            markSettingsDirty("未保存");
+            renderList();
+          }));
+        }
+        item.appendChild(header);
+        const textarea = document.createElement("textarea");
+        textarea.value = entry.template || "";
+        textarea.placeholder = "例: 賃料：{rent}";
+        textarea.addEventListener("input", () => {
+          entry.template = textarea.value;
+          if (index === 0) profile.outputTemplate = entry.template;
+          markSettingsDirty("未保存");
+        });
+        item.appendChild(textarea);
+        list.appendChild(item);
+      });
+    };
+    renderList();
+    wrapper.appendChild(list);
+    const actions = el("div", "rech-inline-actions");
+    actions.appendChild(button("コピー文面を追加", "rech-secondary", () => {
+      profile.outputTemplates.push({
+        name: `コピー文面${profile.outputTemplates.length + 1}`,
+        template: DEFAULT_OUTPUT_TEMPLATE,
+      });
+      markSettingsDirty("未保存");
+      renderList();
+    }));
+    wrapper.appendChild(actions);
+    return wrapper;
   }
 
   function closeSettingsModal(options) {
@@ -2710,6 +3092,8 @@
     let selectedSourceNode = null;
     let pendingAiConfig = null;
     let pendingAiReport = null;
+    let aiRound = 0;
+    const sessionPanel = renderAiSessionPanel();
     const sourceControl = renderAiHtmlSourceControl(config, (node) => {
       selectedSourceNode = node;
     });
@@ -2720,16 +3104,34 @@
     const responseArea = document.createElement("textarea");
     responseArea.className = "rech-ai-textarea";
     responseArea.placeholder = "AIが返したJSON全体をここに貼り付けます";
+    const userReviewNote = document.createElement("textarea");
+    userReviewNote.className = "rech-ai-textarea rech-ai-note-textarea";
+    userReviewNote.placeholder = "AIへ返すメモ。例: 賃料と管理費は正しい。号室だけ階数を拾っている。ADは未記載でよい。";
+    const retryPromptArea = document.createElement("textarea");
+    retryPromptArea.className = "rech-ai-textarea rech-ai-retry-textarea";
+    retryPromptArea.readOnly = true;
+    retryPromptArea.placeholder = "修正依頼を作成すると、次にAIへ貼る内容がここに表示されます";
     const reviewPanel = el("div", "rech-ai-review");
     const promptActions = el("div", "rech-ai-actions");
     promptActions.appendChild(button("AI用情報をコピー", "rech-secondary", async () => {
       try {
+        if (sourceControl && typeof sourceControl.refreshAiSourceStatus === "function") {
+          sourceControl.refreshAiSourceStatus();
+        }
         const prompt = buildAiSelectorPrompt(config, {
           htmlScopeMode: getAiHtmlScopeMode(sourceControl),
           selectedNode: selectedSourceNode,
         });
         promptArea.value = prompt;
         await copyToClipboard(prompt);
+        updateAiSessionPanel(sessionPanel, {
+          round: aiRound,
+          state: "AIへ初回依頼を送る準備ができました",
+          next: getAiSourceSessionNextText(sourceControl) || "コピーした内容をAIに貼り、返ってきたJSONを下に貼ってください。",
+        });
+        appendAiAssistantLog("initial_prompt_copy", prompt, null, {
+          htmlScopeMode: getAiHtmlScopeMode(sourceControl),
+        });
         showToast("AI用情報をコピーしました", "success");
       } catch (error) {
         console.warn("[RealEstateCopyHelper] AI用情報のコピーに失敗しました", error);
@@ -2742,63 +3144,127 @@
         return;
       }
       replaceListingExtractorConfig(config, pendingAiConfig);
+      appendAiAssistantLog("adopt", responseArea.value, pendingAiReport, {
+        note: "ユーザーが仮設定を採用",
+        userReviewNote: userReviewNote.value,
+      });
       pendingAiConfig = null;
       pendingAiReport = null;
       renderAiReviewPanel(reviewPanel, null);
-      applyButton.disabled = true;
+      setAiActionSoftDisabled(applyButton, true);
+      setAiActionSoftDisabled(retryButton, true);
+      updateAiSessionPanel(sessionPanel, {
+        round: aiRound,
+        state: "仮設定を採用しました",
+        next: "保存後、実際のテーブルで欠けやズレがないか確認してください。",
+      });
       onApplied();
-      showToast("AI設定を採用しました", "success");
+      showToast("仮設定を採用しました", "success");
     });
-    applyButton.disabled = true;
+    setAiActionSoftDisabled(applyButton, true);
     const retryButton = button("修正依頼をコピー", "rech-secondary", async () => {
       if (!pendingAiReport) {
         showToast("先に検証して仮プレビューしてください", "error");
         return;
       }
       try {
-        const retryPrompt = buildAiSelectorRetryPrompt(pendingAiReport, responseArea.value);
+        const retryPrompt = buildAiSelectorRetryPrompt(pendingAiReport, responseArea.value, {
+          round: aiRound,
+          userReviewNote: userReviewNote.value,
+        });
+        retryPromptArea.value = retryPrompt;
         await copyToClipboard(retryPrompt);
+        appendAiAssistantLog("retry_copy", responseArea.value, pendingAiReport, {
+          retryPrompt: truncateText(retryPrompt, 60000),
+          userReviewNote: userReviewNote.value,
+          round: aiRound,
+        });
+        updateAiSessionPanel(sessionPanel, {
+          round: aiRound,
+          state: "次の修正依頼をコピーしました",
+          next: "AIの返答JSONをもう一度貼り、仮プレビューで差分を確認してください。",
+        });
         showToast("修正依頼をコピーしました", "success");
       } catch (error) {
         console.warn("[RealEstateCopyHelper] AI修正依頼のコピーに失敗しました", error);
         showToast("修正依頼のコピーに失敗しました", "error");
       }
     });
-    retryButton.disabled = true;
+    setAiActionSoftDisabled(retryButton, true);
     const previewActions = el("div", "rech-ai-actions");
     previewActions.appendChild(button("検証して仮プレビュー", "rech-primary", () => {
       try {
+        aiRound += 1;
         const parsed = parseAiSelectorResponse(responseArea.value);
         const draft = clonePlain(config);
         const result = applyAiListingResponse(draft, parsed, { collectReport: true });
         if (!result.applied) {
           pendingAiConfig = null;
           pendingAiReport = result.report;
+          pendingAiReport.aiRound = aiRound;
           renderAiReviewPanel(reviewPanel, result.report);
-          applyButton.disabled = true;
-          retryButton.disabled = false;
+          setAiActionSoftDisabled(applyButton, true);
+          setAiActionSoftDisabled(retryButton, false);
+          appendAiAssistantLog("preview_no_rules", responseArea.value, result.report, { round: aiRound });
+          updateAiSessionPanel(sessionPanel, {
+            round: aiRound,
+            state: "AI回答を検証しましたが、反映できる設定がありません",
+            next: "JSONの形かキー名が違います。修正依頼をコピーしてAIへ戻してください。",
+          });
           showToast("反映できる設定が見つかりませんでした", "error");
           return;
         }
         pendingAiConfig = draft;
         pendingAiReport = validateAiListingDraft(draft, result.report);
+        pendingAiReport.aiRound = aiRound;
+        pendingAiReport.configDiffs = buildListingConfigDiffSummary(config, draft);
+        addAdoptionRiskWarnings(config, draft, pendingAiReport);
         renderAiReviewPanel(reviewPanel, pendingAiReport);
-        applyButton.disabled = pendingAiReport.errors.length > 0;
-        retryButton.disabled = false;
-        showToast(pendingAiReport.errors.length ? "エラーがあります。修正して再プレビューしてください" : "仮プレビューを作成しました。問題なければ採用してください", pendingAiReport.errors.length ? "error" : "success");
+        setAiActionSoftDisabled(applyButton, false);
+        setAiActionSoftDisabled(retryButton, false);
+        appendAiAssistantLog("preview", responseArea.value, pendingAiReport, { round: aiRound });
+        updateAiSessionPanel(sessionPanel, {
+          round: aiRound,
+          state: pendingAiReport.errors.length ? "仮プレビューにエラーがあります" : pendingAiReport.warnings.length ? "仮プレビューに確認点があります" : "仮プレビューは採用候補です",
+          next: pendingAiReport.errors.length || pendingAiReport.warnings.length
+            ? "正しい項目は修正チェックを外し、違う項目だけチェックして修正依頼をコピーしてください。"
+            : "表が目視で正しければ採用してください。気になる列だけメモして修正依頼もできます。",
+        });
+        showToast(pendingAiReport.errors.length ? "エラーがあります。正しい場合はそのまま採用できます" : "仮プレビューを作成しました。問題なければ採用してください", pendingAiReport.errors.length ? "error" : "success");
       } catch (error) {
         console.warn("[RealEstateCopyHelper] AI回答JSONの反映に失敗しました", error);
         pendingAiConfig = null;
         pendingAiReport = createAiParseErrorReport(error);
+        pendingAiReport.aiRound = aiRound;
         renderAiReviewPanel(reviewPanel, pendingAiReport);
-        applyButton.disabled = true;
-        retryButton.disabled = false;
+        setAiActionSoftDisabled(applyButton, true);
+        setAiActionSoftDisabled(retryButton, false);
+        appendAiAssistantLog("preview_parse_error", responseArea.value, pendingAiReport, {
+          error: error && error.message ? error.message : String(error || ""),
+          round: aiRound,
+        });
+        updateAiSessionPanel(sessionPanel, {
+          round: aiRound,
+          state: "JSONを読み取れませんでした",
+          next: "AIの返答からJSON部分だけを貼るか、修正依頼をコピーしてJSONだけで返すよう依頼してください。",
+        });
         showToast("AI回答JSONが不正です", "error");
       }
     }));
+    const retryActions = el("div", "rech-ai-actions");
+    retryActions.appendChild(retryButton);
     const finishActions = el("div", "rech-ai-actions");
     finishActions.appendChild(applyButton);
-    finishActions.appendChild(retryButton);
+    finishActions.appendChild(button("JSONログをコピー", "rech-secondary", async () => {
+      try {
+        await copyToClipboard(JSON.stringify(settings.aiAssistantLogs || [], null, 2));
+        showToast("JSONログをコピーしました", "success");
+      } catch (error) {
+        console.warn("[RealEstateCopyHelper] AI補助ログのコピーに失敗しました", error);
+        showToast("JSONログのコピーに失敗しました", "error");
+      }
+    }));
+    details.appendChild(sessionPanel.wrapper);
     details.appendChild(renderAiWorkflowStep("1", "全体を見る", "まずページ全体をAIに渡します。必要なら1物件だけ、1部屋だけ、選択部分だけに絞れます。", [
       sourceControl,
       promptActions,
@@ -2816,10 +3282,35 @@
       previewActions,
       reviewPanel,
     ]));
-    details.appendChild(renderAiWorkflowStep("5", "採用して表を完成させる", "仮プレビューが問題なければ採用します。警告が残る場合は修正依頼をAIに戻して再調整します。", [
+    details.appendChild(renderAiWorkflowStep("5", "AIへ戻して直す", "正しい項目は修正対象から外し、違う項目だけをメモ付きでAIへ戻します。", [
+      el("label", "rech-ai-label", "AIへ返すメモ"),
+      userReviewNote,
+      retryActions,
+      el("label", "rech-ai-label", "次の修正依頼"),
+      retryPromptArea,
+    ]));
+    details.appendChild(renderAiWorkflowStep("6", "採用して表を完成させる", "自動判定で警告やエラーが出ても、表が正しければ採用できます。違う項目だけ修正依頼に戻します。", [
       finishActions,
     ]));
     return details;
+  }
+
+  function renderAiSessionPanel() {
+    const wrapper = el("div", "rech-ai-session");
+    const round = el("strong", "", "ラウンド 0");
+    const state = el("span", "", "AI用情報をコピーして開始します");
+    const next = el("small", "", "まずはページ全体または選択範囲をAIへ渡してください。");
+    wrapper.appendChild(round);
+    wrapper.appendChild(state);
+    wrapper.appendChild(next);
+    return { wrapper, round, state, next };
+  }
+
+  function updateAiSessionPanel(panel, info) {
+    if (!panel) return;
+    panel.round.textContent = `ラウンド ${info && info.round ? info.round : 0}`;
+    panel.state.textContent = info && info.state ? info.state : "";
+    panel.next.textContent = info && info.next ? info.next : "";
   }
 
   function renderAiWorkflowStep(number, title, description, children) {
@@ -2849,6 +3340,12 @@
     return list;
   }
 
+  function setAiActionSoftDisabled(buttonNode, disabled) {
+    if (!buttonNode) return;
+    buttonNode.classList.toggle("is-soft-disabled", Boolean(disabled));
+    buttonNode.setAttribute("aria-disabled", disabled ? "true" : "false");
+  }
+
   function renderAiHtmlSourceControl(config, onSelected) {
     const wrapper = el("div", "rech-ai-source-control");
     wrapper.appendChild(termWithHelp("AIに見せるHTMLを選ぶ", "AI用情報をコピーするとき、ページHTMLのどの部分をAIに見せるかを選びます。迷ったら「ページ全体」のままで構いません。"));
@@ -2870,10 +3367,21 @@
     select.value = settings.uiSettings.aiHtmlScopeMode || "body";
     let selectedNode = null;
     const status = el("span", "rech-ai-source-status", getAiHtmlSourceStatus(config, select.value, selectedNode));
+    const diagnostics = el("div", "rech-ai-source-diagnostics");
+    const refreshDiagnostics = () => {
+      const summary = getAiCopyReadinessSummary(config, {
+        htmlScopeMode: select.value,
+        selectedNode,
+      });
+      status.textContent = getAiHtmlSourceStatus(config, select.value, selectedNode, summary);
+      renderAiSourceDiagnostics(diagnostics, summary);
+      wrapper.aiSourceSummary = summary;
+      return summary;
+    };
     select.addEventListener("change", () => {
       settings.uiSettings.aiHtmlScopeMode = select.value;
       saveUiSettingsOnly();
-      status.textContent = getAiHtmlSourceStatus(config, select.value, selectedNode);
+      refreshDiagnostics();
     });
     row.appendChild(select);
     row.appendChild(el("span", "rech-ai-source-step", "選択"));
@@ -2886,9 +3394,16 @@
         onPicked: (node) => {
           selectedNode = node;
           if (typeof onSelected === "function") onSelected(node);
-          status.textContent = getAiHtmlSourceStatus(config, "selected", node);
+          refreshDiagnostics();
         },
       });
+    }));
+    row.appendChild(button("再スキャン", "rech-secondary rech-mini-button", () => {
+      const summary = refreshDiagnostics();
+      const message = summary.roomCandidateCount
+        ? `部屋候補 ${summary.roomCandidateCount}件を確認しました`
+        : "再スキャンしました。部屋候補が少ない場合は一覧を展開してください";
+      showToast(message, summary.roomCandidateCount ? "success" : "error");
     }));
     row.appendChild(status);
     const guide = el("div", "rech-ai-source-help");
@@ -2903,6 +3418,9 @@
     ].forEach((text) => guide.appendChild(el("span", "", text)));
     wrapper.appendChild(guide);
     wrapper.appendChild(row);
+    wrapper.appendChild(diagnostics);
+    wrapper.refreshAiSourceStatus = refreshDiagnostics;
+    refreshDiagnostics();
     return wrapper;
   }
 
@@ -2911,10 +3429,90 @@
     return select ? select.value : "body";
   }
 
-  function getAiHtmlSourceStatus(config, mode, selectedNode) {
-    const source = getAiHtmlSource(config, { htmlScopeMode: mode, selectedNode });
+  function getAiHtmlSourceStatus(config, mode, selectedNode, summary) {
+    const source = summary && summary.source ? summary.source : getAiHtmlSource(config, { htmlScopeMode: mode, selectedNode });
     if (mode === "selected" && !selectedNode) return "未選択: 「画面から選ぶ」を押して、ページ上の見せたい部分をクリックしてください";
-    return `現在: ${source.label}。次は「AI用情報をコピー」を押します`;
+    const roomText = summary ? ` / 部屋候補 ${summary.roomCandidateCount}件` : "";
+    return `現在: ${source.label}${roomText}。展開後は再スキャンしてからコピーします`;
+  }
+
+  function getAiSourceSessionNextText(control) {
+    const summary = control && control.aiSourceSummary;
+    if (!summary) return "";
+    const parts = [
+      `コピー内容には部屋候補 ${summary.roomCandidateCount}件、表候補 ${summary.tableCandidateCount}件を含めています。`,
+    ];
+    if (!summary.roomCandidateCount && !summary.tableCandidateCount) {
+      parts.push("候補が少ないため、一覧を展開するか、画面から一覧部分を選んで再スキャンしてください。");
+    } else if (summary.hasLikelyTruncatedList) {
+      parts.push("部屋候補が少ない可能性があります。イタンジ側の一覧表示/もっと見るを押した後、再スキャンしてください。");
+    } else {
+      parts.push("AIに貼り、返ってきたJSONを下に貼ってください。");
+    }
+    return parts.join(" ");
+  }
+
+  function getAiCopyReadinessSummary(config, options) {
+    const source = getAiHtmlSource(config, options || {});
+    const snippets = getAiHtmlSnippets(config);
+    const htmlLimit = source.mode === "body" ? 60000 : 30000;
+    const sanitizedHtml = sanitizeHtmlForAiWithLimit(source.node || document.body, htmlLimit);
+    const roomCandidateCount = snippets.roomCandidates ? snippets.roomCandidates.length : 0;
+    const totalRoomCandidateCount = snippets.copyDiagnostics ? snippets.copyDiagnostics.totalRoomCandidateCount || roomCandidateCount : roomCandidateCount;
+    const omittedRoomCandidateCount = Math.max(0, totalRoomCandidateCount - roomCandidateCount);
+    const tableCandidateCount = snippets.tableCandidates ? snippets.tableCandidates.length : 0;
+    const repeatingGroupCount = snippets.repeatingGroups ? snippets.repeatingGroups.length : 0;
+    const fieldEvidenceCount = snippets.fieldEvidence ? snippets.fieldEvidence.length : 0;
+    const warnings = snippets.copyDiagnostics && Array.isArray(snippets.copyDiagnostics.warnings)
+      ? snippets.copyDiagnostics.warnings.slice()
+      : [];
+    const hasLikelyTruncatedList = roomCandidateCount > 0 && roomCandidateCount < 5 && hasMoreListingExpansionButtonText();
+    if (hasLikelyTruncatedList) warnings.push("一覧表示/もっと見るボタンが残っている可能性があります。展開後に再スキャンしてください。");
+    if (omittedRoomCandidateCount > 0) warnings.push(`候補が多いためAIには上位${roomCandidateCount}件を渡します。必要なら一覧部分を選択して範囲を絞ってください。`);
+    return {
+      source,
+      roomCandidateCount,
+      totalRoomCandidateCount,
+      omittedRoomCandidateCount,
+      tableCandidateCount,
+      itemCandidateCount: snippets.itemCandidates ? snippets.itemCandidates.length : 0,
+      repeatingGroupCount,
+      fieldEvidenceCount,
+      sanitizedHtmlLength: sanitizedHtml.length,
+      htmlLimit,
+      warnings,
+      hasLikelyTruncatedList,
+    };
+  }
+
+  function renderAiSourceDiagnostics(container, summary) {
+    if (!container || !summary) return;
+    container.innerHTML = "";
+    [
+      ["部屋候補", summary.omittedRoomCandidateCount ? `${summary.roomCandidateCount}/${summary.totalRoomCandidateCount}件` : `${summary.roomCandidateCount}件`],
+      ["表候補", `${summary.tableCandidateCount}件`],
+      ["繰り返し候補", `${summary.repeatingGroupCount}件`],
+      ["項目根拠", `${summary.fieldEvidenceCount}項目`],
+      ["HTML量", `${summary.sanitizedHtmlLength.toLocaleString("ja-JP")}文字`],
+    ].forEach(([label, value]) => {
+      const item = el("span", "rech-ai-source-metric");
+      item.appendChild(el("strong", "", label));
+      item.appendChild(document.createTextNode(value));
+      container.appendChild(item);
+    });
+    const note = el("small", "rech-ai-source-diagnostics-note", "");
+    if (summary.warnings && summary.warnings.length) {
+      note.textContent = summary.warnings.slice(0, 2).join(" / ");
+      note.classList.add("is-warning");
+    } else {
+      note.textContent = "イタンジなどで残り部屋を展開した後は、再スキャンして候補数が増えたことを確認してください。";
+    }
+    container.appendChild(note);
+  }
+
+  function hasMoreListingExpansionButtonText() {
+    const text = normalizeText(document.body && (document.body.innerText || document.body.textContent || "") || "");
+    return /もっと見る|一覧表示|全て表示|すべて表示|部屋番号順|残り[0-9]+件|さらに表示|表示件数を増やす/.test(text);
   }
 
   function renderAiSelectorUsageGuide() {
@@ -2941,14 +3539,37 @@
   function buildAiSelectorPrompt(config, options) {
     const snippets = getAiHtmlSnippets(config);
     const htmlSource = getAiHtmlSource(config, options || {});
+    const sanitizedBodyHtml = sanitizeHtmlForAiWithLimit(htmlSource.node || document.body, htmlSource.mode === "body" ? 60000 : 30000);
     const payload = {
       task: "不動産一覧ページから部屋ごとの表を作るためのCSSセレクタ、正規表現、整形方法を提案してください。",
       privacy: "ログインが必要な画面を想定しているため、ページURLは含めていません。HTML内のhref/src/action/data-detailurl、フォーム値、token/key/session系の属性値は伏せています。",
       fields: getListingFieldIds().map(({ key, label }) => ({ key, label })),
       outputJsonOnly: true,
       expectedResponseShape: {
+        extractionStrategy: "css / tableExtraction / roomCells のいずれか。混ぜすぎない",
         itemSelector: "1物件のまとまりのCSS。不要なら空文字",
         rowSelector: "1部屋のまとまりのCSS。不要なら空文字",
+        tableExtraction: {
+          enabled: "htmlSnippets.tableCandidatesに適切な表がある場合だけtrue。表でないサイトではfalseまたは省略",
+          mode: "standard または roomCells",
+          tableSelector: "対象tableのCSS",
+          rowSelector: "standardならtr。データ行だけを選べるならそのCSS",
+          cellSelector: "standardならtd,th",
+          headerRowIndex: 0,
+          dataStartRowIndex: 1,
+          roomSelector: "roomCellsの場合の1部屋セルCSS",
+          buildingNameSelector: "表外に物件名がある場合だけCSS",
+          columns: {
+            room: 0,
+            layout: 1,
+            area: 2,
+            rent: 3,
+            managementFee: 4,
+            depositKeyMoney: 5,
+            availableDate: 6,
+          },
+          excludeColumns: ["備考など表に出さない列"],
+        },
         fields: {
           buildingName: { scope: "item", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "text" },
           rent: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "rent" },
@@ -2957,6 +3578,12 @@
           keyMoney: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "rentMonth" },
           layout: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "layout" },
           area: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "area" },
+        },
+        selfCheck: {
+          expectedRowCount: "この設定で取れると想定する部屋行数",
+          sampleRows: "想定される先頭数行の値",
+          uncertainFields: ["自信が低い項目名"],
+          reason: "この方式を選んだ理由",
         },
       },
       rules: [
@@ -2970,15 +3597,34 @@
         "scopeは item, row, document のいずれかにしてください。基本は物件名がitem、部屋項目がrowです。",
         "selectorに自信がない項目はselectorCandidatesに複数候補を入れてください。ツール側で先頭を主候補、残りを予備候補として検証します。",
         "広すぎるセレクタ、取得0件になりそうなセレクタ、nth-childだらけのセレクタは避けてください。",
+        "extractionStrategyは css / tableExtraction / roomCells のどれか1つを主方式として選んでください。表が十分ならtableExtractionまたはroomCells、表でなければcssを選んでください。",
+        "htmlSnippets.fieldValueCandidatesの候補値と、実際に返すselector/regexで取れる値が矛盾しないようにしてください。",
+        "selfCheckに想定行数、サンプル値、不安な項目を入れてください。ツール側で検証します。",
+        "号室には階数だけを入れないでください。部屋番号がない一般サイトでは空欄または取得不能として扱ってください。",
+        "htmlSnippets.tableCandidatesに部屋一覧として使える表がある場合は、CSS fieldsよりtableExtractionを優先してください。ただし表ではないサイトではtableExtractionを使わないでください。",
+        "通常のHTMLテーブルで1行が1部屋なら mode は standard、td.roomなど1セルが1部屋なら mode は roomCells にしてください。",
+        "敷金/礼金が1セルの場合は columns.depositKeyMoney に列番号またはセル指定を入れてください。備考列は excludeColumns に入れ、コピー対象にはしないでください。",
+        "sanitizedBodyHtmlでは検索フォーム、ナビゲーション、入力部品、操作ボタンをできるだけ除外しています。部屋情報がある場合は削りすぎないように残していることがあります。",
+        "htmlSnippets.roomCandidates / repeatingGroups / fieldEvidence を優先して見てください。itemCandidates や sanitizedBodyHtml に検索フォームが残る場合があります。",
       ],
       currentConfig: serializeAiRelevantListingConfig(config),
       htmlSnippets: snippets,
+      copySummary: {
+        includedRoomCandidateCount: snippets.roomCandidates ? snippets.roomCandidates.length : 0,
+        estimatedRoomCandidateCount: snippets.copyDiagnostics ? snippets.copyDiagnostics.totalRoomCandidateCount || 0 : 0,
+        omittedRoomCandidateCount: snippets.copyDiagnostics ? snippets.copyDiagnostics.omittedRoomCandidateCount || 0 : 0,
+        includedTableCandidateCount: snippets.tableCandidates ? snippets.tableCandidates.length : 0,
+        includedRepeatingGroupCount: snippets.repeatingGroups ? snippets.repeatingGroups.length : 0,
+        includedFieldEvidenceCount: snippets.fieldEvidence ? snippets.fieldEvidence.length : 0,
+        sanitizedBodyHtmlLength: sanitizedBodyHtml.length,
+        note: "イタンジ等で一覧表示/もっと見るを押した後は、再スキャンして候補数が増えた状態でコピーしてください。",
+      },
       htmlScope: {
         mode: htmlSource.mode,
         label: htmlSource.label,
-        note: "sanitizedBodyHtmlには、選択された範囲のHTMLを入れています。modeがbodyの場合はbody全体です。body全文で渡す機能は残しています。",
+        note: "sanitizedBodyHtmlには、選択された範囲から検索フォームや操作UIをできるだけ除外したHTMLを入れています。modeがbodyの場合はbody全体です。body全文で渡す機能は残しています。",
       },
-      sanitizedBodyHtml: sanitizeHtmlForAiWithLimit(htmlSource.node || document.body, htmlSource.mode === "body" ? 60000 : 30000),
+      sanitizedBodyHtml,
     };
     return [
       "以下の情報から、抽出設定JSONを作成してください。",
@@ -3006,16 +3652,223 @@
       itemSelector: config.itemSelector || "",
       rowSelector: config.rowSelector || "",
       scopeMode: config.scopeMode || "mixed",
+      tableExtraction: serializeAiTableExtractionConfig(config.tableExtraction),
       fields,
     };
   }
 
-  function getAiHtmlSnippets(config) {
-    const itemNodes = getAiItemSnippetNodes(config).slice(0, 3);
-    const roomNodes = getAiRoomSnippetNodes(config).slice(0, 5);
+  function serializeAiTableExtractionConfig(tableExtraction) {
+    const tableConfig = sanitizeTableExtractionConfig(tableExtraction || createDefaultTableExtraction());
     return {
-      itemCandidates: itemNodes.map((node, index) => getAiSnippetEntry(node, index + 1)),
-      roomCandidates: roomNodes.map((node, index) => getAiSnippetEntry(node, index + 1)),
+      enabled: tableConfig.enabled,
+      mode: tableConfig.mode,
+      tableSelector: tableConfig.tableSelector,
+      rowSelector: tableConfig.rowSelector,
+      cellSelector: tableConfig.cellSelector,
+      dataStartRowIndex: tableConfig.dataStartRowIndex,
+      roomSelector: tableConfig.roomSelector,
+      buildingNameSelector: tableConfig.buildingNameSelector,
+      columns: tableConfig.columns,
+      excludeColumns: tableConfig.excludeColumns,
+    };
+  }
+
+  function getAiHtmlSnippets(config) {
+    const configuredRoomNodes = getAiRoomSnippetNodes(config);
+    const inferredRoomNodes = inferAiRoomSnippetCandidates();
+    const allRoomNodes = dedupeNodes([...configuredRoomNodes, ...inferredRoomNodes]);
+    const roomNodes = allRoomNodes.slice(0, 12);
+    const itemNodes = getAiItemSnippetNodes(config).slice(0, 3);
+    const tableCandidates = getAiTableCandidateSnippets();
+    return {
+      copyDiagnostics: buildAiCopyDiagnostics(config, itemNodes, roomNodes, inferredRoomNodes, allRoomNodes, tableCandidates),
+      tableCandidates,
+      itemCandidates: itemNodes.map((node, index) => getAiSnippetEntry(node, index + 1, { htmlLimit: 9000, textLimit: 900 })),
+      roomCandidates: roomNodes.map((node, index) => ({
+        ...getAiSnippetEntry(node, index + 1, { htmlLimit: 12000, textLimit: 1400 }),
+        score: scoreAiRoomCandidate(node),
+        diagnostics: summarizeAiRoomCandidate(node),
+      })),
+      repeatingGroups: getAiRepeatingGroupSnippets(roomNodes),
+      fieldEvidence: getAiFieldEvidenceSnippets(config, roomNodes),
+      fieldValueCandidates: getAiFieldValueCandidateLists(allRoomNodes),
+    };
+  }
+
+  function getAiTableCandidateSnippets() {
+    return Array.from(document.querySelectorAll("table"))
+      .filter((table) => table && !(table.closest && table.closest(`#${APP_ID}, #${APP_ID}-modal`)))
+      .map((table) => ({ table, score: scoreAiTableCandidate(table) }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 6)
+      .map((entry, index) => buildAiTableCandidateSnippet(entry.table, index + 1));
+  }
+
+  function scoreAiTableCandidate(table) {
+    const matrix = getAiTableMatrix(table, 8, 10);
+    const rowCount = matrix.length;
+    const columnCount = Math.max(0, ...matrix.map((row) => row.length));
+    const text = normalizeNumberText(matrix.flat().join(" "));
+    let score = 0;
+    if (rowCount >= 2 && columnCount >= 3) score += 8;
+    if (/賃料|家賃|[0-9]+(?:\.[0-9]+)?\s*万(?:円)?|[0-9][0-9,]*\s*円/.test(text)) score += 8;
+    if (/間取り|[0-9]\s*(?:SLDK|LDK|SDK|DK|SK|R|K)\b|ワンルーム/i.test(text)) score += 6;
+    if (/専有|面積|[0-9]+(?:\.[0-9]+)?\s*(?:㎡|m2|m²|平米)/i.test(text)) score += 6;
+    if (/部屋|号室|入居|敷金|礼金|管理費|共益費/.test(text)) score += 5;
+    if (detectAiTableMode(table) === "roomCells") score += 5;
+    if (/条件|検索|ログイン|パスワード|メールアドレス/.test(text) && rowCount < 4) score -= 8;
+    return score;
+  }
+
+  function buildAiTableCandidateSnippet(table, index) {
+    const matrix = getAiTableMatrix(table, 8, 10);
+    const mode = detectAiTableMode(table);
+    const selectors = buildAiCandidateSelectors(table);
+    return {
+      index,
+      tag: "table",
+      id: table.id || "",
+      className: typeof table.className === "string" ? table.className : "",
+      stableCssPath: buildStableCssPath(table),
+      candidateSelectors: selectors,
+      likelyMode: mode,
+      rowCount: Array.from(table.rows || safeQuerySelectorAll(table, "tr")).length,
+      columnCount: Math.max(0, ...matrix.map((row) => row.length)),
+      headers: getAiTableHeaders(table),
+      matrix,
+      roomCellSamples: mode === "roomCells" ? getAiRoomCellSamples(table) : [],
+      suggestedTableExtraction: inferAiTableExtraction(table, mode),
+    };
+  }
+
+  function getAiTableMatrix(table, rowLimit, cellLimit) {
+    const rows = Array.from(table.rows || safeQuerySelectorAll(table, "tr")).slice(0, rowLimit);
+    return rows.map((row) => getTableRowCells(row, "td,th")
+      .slice(0, cellLimit)
+      .map((cell) => truncateText(normalizeText(cell.innerText || cell.textContent || ""), 160)));
+  }
+
+  function getAiTableHeaders(table) {
+    const rows = Array.from(table.rows || safeQuerySelectorAll(table, "tr"));
+    const headerRow = rows.find((row) => getTableRowCells(row, "td,th").some((cell) => cell.tagName === "TH"))
+      || rows.find((row) => getTableRowCells(row, "td,th").some((cell) => inferListingFieldKeyFromHeader(cell.innerText || cell.textContent || "")))
+      || rows[0];
+    if (!headerRow) return [];
+    return getTableRowCells(headerRow, "td,th").map((cell) => truncateText(normalizeText(cell.innerText || cell.textContent || ""), 80));
+  }
+
+  function detectAiTableMode(table) {
+    const roomCells = safeQuerySelectorAll(table, "td.room, [class~='room']")
+      .filter((node) => hasRoomLikeText(node.innerText || node.textContent || ""));
+    return roomCells.length >= 2 ? "roomCells" : "standard";
+  }
+
+  function getAiRoomCellSamples(table) {
+    return safeQuerySelectorAll(table, "td.room, [class~='room']")
+      .filter((node) => hasRoomLikeText(node.innerText || node.textContent || ""))
+      .slice(0, 5)
+      .map((node, index) => ({
+        index: index + 1,
+        candidateSelectors: buildAiCandidateSelectors(node),
+        text: truncateText(normalizeText(node.innerText || node.textContent || ""), 300),
+      }));
+  }
+
+  function inferAiTableExtraction(table, mode) {
+    const tableSelector = buildAiCandidateSelectors(table)[0] || buildStableCssPath(table) || "table";
+    if (mode === "roomCells") {
+      return {
+        enabled: true,
+        mode: "roomCells",
+        tableSelector,
+        roomSelector: "td.room, [class~='room']",
+        columns: inferAiRoomCellColumns(table),
+      };
+    }
+    const headers = getAiTableHeaders(table);
+    const columns = {};
+    headers.forEach((header, columnIndex) => {
+      const key = inferListingFieldKeyFromHeader(header);
+      if (key && !columns[key]) columns[key] = columnIndex;
+    });
+    return {
+      enabled: true,
+      mode: "standard",
+      tableSelector,
+      rowSelector: "tr",
+      cellSelector: "td,th",
+      headerRowIndex: 0,
+      dataStartRowIndex: headers.some(inferListingFieldKeyFromHeader) ? 1 : 0,
+      columns,
+    };
+  }
+
+  function inferAiRoomCellColumns(table) {
+    const first = safeQuerySelectorAll(table, "td.room, [class~='room']")
+      .find((node) => hasRoomLikeText(node.innerText || node.textContent || ""));
+    const columns = {};
+    if (!first) return columns;
+    const selectorMap = {
+      room: [".number", "[class*='number']", "[class*='room']"],
+      rent: [".rent", "[class*='rent']", "[class*='price']"],
+      managementFee: [".fee", "[class*='fee']", "[class*='kanri']"],
+      layout: [".plan", ".layout", "[class*='plan']", "[class*='layout']"],
+      area: [".area", "[class*='area']", "[class*='menseki']"],
+      availableDate: [".available", ".move", "[class*='available']", "[class*='move']"],
+    };
+    Object.entries(selectorMap).forEach(([key, selectors]) => {
+      const selector = selectors.find((candidate) => isSelectorValidForPreview(candidate) && safeQuerySelector(first, candidate));
+      if (selector) columns[key] = { selector };
+    });
+    return columns;
+  }
+
+  function inferListingFieldKeyFromHeader(value) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    if (!text) return "";
+    if (/物件名|建物名|マンション名|アパート名/.test(text)) return "buildingName";
+    if (/部屋番号|号室|^部屋$|^号$/.test(text)) return "room";
+    if (/間取り|タイプ/.test(text)) return "layout";
+    if (/専有面積|面積|㎡|m2|m²|平米/i.test(text)) return "area";
+    if (/賃料|家賃|月額賃料/.test(text)) return "rent";
+    if (/管理費|共益費|管理・共益費|管理費・共益費/.test(text)) return "managementFee";
+    if (/敷金.*礼金|礼金.*敷金|敷\/礼|敷礼|敷金\/礼金|敷金・礼金/.test(text)) return "depositKeyMoney";
+    if (/敷金|保証金/.test(text)) return "deposit";
+    if (/礼金/.test(text)) return "keyMoney";
+    if (/入居|入居日|入居時期|引渡|空室|予定/.test(text)) return "availableDate";
+    if (/\bAD\b|広告料|広告費/i.test(text)) return "ad";
+    return "";
+  }
+
+  function buildAiCopyDiagnostics(config, itemNodes, roomNodes, inferredRoomNodes, allRoomNodes, tableCandidates) {
+    const configuredRowCount = config.rowSelector && isSelectorValidForPreview(config.rowSelector)
+      ? safeQuerySelectorAll(document, config.rowSelector).length
+      : 0;
+    const configuredItemCount = config.itemSelector && isSelectorValidForPreview(config.itemSelector)
+      ? safeQuerySelectorAll(document, config.itemSelector).length
+      : 0;
+    const bodyText = normalizeText(document.body && (document.body.innerText || document.body.textContent || "") || "");
+    const warnings = [];
+    if (!roomNodes.length) warnings.push("部屋候補HTMLが見つかっていません。body全文または画面選択が必要です。");
+    if (itemNodes.some(isAiSearchOrFilterContainer)) warnings.push("1物件候補に検索フォーム/絞り込みUIが混ざっている可能性があります。roomCandidatesを優先してください。");
+    if (configuredRowCount > 80) warnings.push("現在のrowSelectorは一致件数が多く、広すぎる可能性があります。");
+    const totalRoomCandidateCount = (allRoomNodes || roomNodes || []).length;
+    const omittedRoomCandidateCount = Math.max(0, totalRoomCandidateCount - (roomNodes || []).length);
+    if (configuredRowCount > 0 && roomNodes.length < Math.min(5, configuredRowCount)) warnings.push("rowSelectorの一致件数に対してAIへ渡す行候補が少ない可能性があります。");
+    if (omittedRoomCandidateCount > 0) warnings.push(`部屋候補は推定${totalRoomCandidateCount}件ありますが、AIへは上位${roomNodes.length}件だけ渡しています。`);
+    return {
+      bodyTextLength: bodyText.length,
+      configuredItemSelector: config.itemSelector || "",
+      configuredItemCount,
+      configuredRowSelector: config.rowSelector || "",
+      configuredRowCount,
+      roomCandidateCount: roomNodes.length,
+      totalRoomCandidateCount,
+      omittedRoomCandidateCount,
+      inferredRoomCandidateCount: inferredRoomNodes.length,
+      tableCandidateCount: (tableCandidates || []).length,
+      warnings,
     };
   }
 
@@ -3046,8 +3899,19 @@
       .filter((entry) => entry.score > 0)
       .sort((a, b) => b.score - a.score)
       .map((entry) => entry.node);
-    return dedupeNodes(candidates).filter((node, index, nodes) => {
-      return !nodes.some((candidate, candidateIndex) => candidateIndex < index && candidate.contains && candidate.contains(node));
+    return filterAiRoomSnippetNodes(candidates);
+  }
+
+  function filterAiRoomSnippetNodes(nodes) {
+    const uniqueNodes = dedupeNodes(nodes || []);
+    return uniqueNodes.filter((node) => {
+      const text = normalizeText(node.innerText || node.textContent || "");
+      return !uniqueNodes.some((candidate) => {
+        if (candidate === node || !node.contains || !node.contains(candidate)) return false;
+        const candidateText = normalizeText(candidate.innerText || candidate.textContent || "");
+        if (candidateText.length < 20 || candidateText.length >= text.length) return false;
+        return hasRoomLikeText(candidateText) && countRoomValueMarkers(text) > countRoomValueMarkers(candidateText) + 2;
+      });
     });
   }
 
@@ -3067,11 +3931,63 @@
     if (extractLayoutFromText(text)) score += 8;
     if (extractAreaFromText(text)) score += 8;
     if (/敷金|礼金|敷|礼/.test(text)) score += 2;
+    if (getSpecificRoomIdentifier(text)) score += 4;
+    if (hasAiRoomValueCluster(text)) score += 10;
+    if (hasComparableSiblingRoomCandidates(node)) score += 6;
     if (node.tagName === "TR") score += 4;
     if (node.tagName === "LI" || node.tagName === "ARTICLE" || node.tagName === "SECTION") score += 2;
     if (node.querySelector && node.querySelector("h1, h2, h3") && !extractRentFromText(text)) score -= 8;
+    if (isAiSearchOrFilterContainer(node)) score -= 16;
+    score -= countAiSearchFilterMarkers(`${node.id || ""} ${typeof node.className === "string" ? node.className : ""} ${text}`) * 5;
+    if (countInteractiveElements(node) > 8 && countRoomValueMarkers(text) < 4) score -= 10;
+    if (text.length > 1200 && countRoomValueMarkers(text) < 5) score -= 8;
     score -= Math.min(4, Math.floor(text.length / 500));
     return score;
+  }
+
+  function summarizeAiRoomCandidate(node) {
+    const text = normalizeNumberText(node && (node.innerText || node.textContent) || "");
+    return {
+      markerCount: countRoomValueMarkers(text),
+      hasRoomNumber: Boolean(getSpecificRoomIdentifier(text)),
+      hasRent: Boolean(extractRentFromText(text)),
+      hasManagementFee: Boolean(extractManagementFeeFromText(text, "")),
+      hasLayout: Boolean(extractLayoutFromText(text)),
+      hasArea: Boolean(extractAreaFromText(text)),
+      hasLeaseCosts: /敷金|礼金|敷|礼/.test(text),
+      searchFilterMarkerCount: countAiSearchFilterMarkers(`${node && node.id || ""} ${node && typeof node.className === "string" ? node.className : ""} ${text}`),
+      interactiveElementCount: countInteractiveElements(node),
+    };
+  }
+
+  function hasAiRoomValueCluster(text) {
+    const normalized = normalizeNumberText(text);
+    const hits = [
+      extractRentFromText(normalized),
+      extractLayoutFromText(normalized),
+      extractAreaFromText(normalized),
+      /敷金|礼金|敷|礼/.test(normalized) ? "lease" : "",
+      getSpecificRoomIdentifier(normalized),
+    ].filter(Boolean).length;
+    return hits >= 3;
+  }
+
+  function hasComparableSiblingRoomCandidates(node) {
+    const parent = node && node.parentElement;
+    if (!parent) return false;
+    const ownTag = node.tagName;
+    const ownClasses = getStableClassTokens(node).join(".");
+    const siblings = Array.from(parent.children || []).filter((sibling) => {
+      if (sibling === node || !hasRoomLikeText(sibling.innerText || sibling.textContent || "")) return false;
+      if (ownTag && sibling.tagName === ownTag) return true;
+      return ownClasses && getStableClassTokens(sibling).join(".") === ownClasses;
+    });
+    return siblings.length >= 1;
+  }
+
+  function countInteractiveElements(node) {
+    if (!node || !node.querySelectorAll) return 0;
+    return node.querySelectorAll("input, textarea, select, button, [role='button'], [role='checkbox'], [role='combobox']").length;
   }
 
   function findAiItemSnippetNode(roomNode) {
@@ -3096,7 +4012,134 @@
     return best;
   }
 
-  function getAiSnippetEntry(node, index) {
+  function getAiRepeatingGroupSnippets(roomNodes) {
+    const groups = [];
+    const parents = dedupeNodes((roomNodes || []).map((node) => node && node.parentElement).filter(Boolean));
+    parents.forEach((parent) => {
+      const children = Array.from(parent.children || []).filter(isUsefulAiRoomCandidate);
+      if (children.length < 2) return;
+      groups.push({
+        parentSelector: buildStableCssPath(parent),
+        parentClassName: typeof parent.className === "string" ? parent.className : "",
+        repeatedChildCount: children.length,
+        repeatedChildSelectors: buildAiCandidateSelectors(children[0]),
+        samples: children.slice(0, 5).map((node, index) => getAiSnippetEntry(node, index + 1, { htmlLimit: 6000, textLimit: 900 })),
+      });
+    });
+    return groups.slice(0, 3);
+  }
+
+  function getAiFieldEvidenceSnippets(config, roomNodes) {
+    const rows = (roomNodes || []).slice(0, 10);
+    return getListingFieldIds().map(({ key, label }) => {
+      const field = config.fields && config.fields[key] ? config.fields[key] : null;
+      const selectorRule = field ? getListingFieldRule(field, "selector") : null;
+      const regexRule = field ? getListingFieldRule(field, "regex") : null;
+      const selector = selectorRule && selectorRule.selector || "";
+      const regex = regexRule && (regexRule.pattern || regexRule.regex) || selectorRule && (selectorRule.pattern || selectorRule.regex) || "";
+      const samples = rows.map((row, rowIndex) => {
+        const text = normalizeText(row.innerText || row.textContent || "");
+        const selectorMatches = selector && isSelectorValidForPreview(selector)
+          ? safeQuerySelectorAllIncludingSelf(row, selector).slice(0, 4).map((node) => truncateText(normalizeText(node.innerText || node.textContent || ""), 240))
+          : [];
+        return {
+          rowIndex: rowIndex + 1,
+          selectorMatches,
+          guessedValue: guessAiFieldEvidenceValue(key, text),
+          rowText: truncateText(text, 500),
+        };
+      }).filter((sample) => sample.selectorMatches.length || sample.guessedValue);
+      return {
+        key,
+        label,
+        currentSelector: selector,
+        currentRegex: regex,
+        expectedFormat: getAiFieldExpectedFormat(key),
+        samples: samples.slice(0, 6),
+      };
+    }).filter((entry) => entry.samples.length || entry.currentSelector || entry.currentRegex);
+  }
+
+  function getAiFieldValueCandidateLists(roomNodes) {
+    const nodes = (roomNodes || []).slice(0, 30);
+    const collectors = {
+      room: new Map(),
+      rent: new Map(),
+      managementFee: new Map(),
+      deposit: new Map(),
+      keyMoney: new Map(),
+      availableDate: new Map(),
+      ad: new Map(),
+      layout: new Map(),
+      area: new Map(),
+    };
+    nodes.forEach((node, nodeIndex) => {
+      const rawText = normalizeNumberText(node && (node.innerText || node.textContent) || "");
+      const guesses = {
+        room: guessAiFieldEvidenceValue("room", rawText) || getSpecificRoomIdentifier(rawText),
+        rent: normalizeConfiguredValue(extractRentFromText(rawText), "rent", "rent"),
+        managementFee: normalizeConfiguredValue(extractManagementFeeFromText(rawText, extractRentFromText(rawText)), "yen", "managementFee"),
+        deposit: normalizeLeaseCostByRent(extractDepositFromText(rawText), extractRentFromText(rawText), "rentMonth"),
+        keyMoney: normalizeLeaseCostByRent(extractKeyMoneyFromText(rawText), extractRentFromText(rawText), "rentMonth"),
+        availableDate: guessAiFieldEvidenceValue("availableDate", rawText),
+        ad: guessAiFieldEvidenceValue("ad", rawText),
+        layout: normalizeConfiguredValue(extractLayoutFromText(rawText), "layout", "layout"),
+        area: normalizeConfiguredValue(extractAreaFromText(rawText), "area", "area"),
+      };
+      Object.entries(guesses).forEach(([key, value]) => {
+        const normalized = normalizeText(value || "");
+        if (!normalized || normalized === "未記載" || normalized === "相談" && key !== "availableDate") return;
+        const bucket = collectors[key];
+        const current = bucket.get(normalized) || { value: normalized, count: 0, rowIndexes: [] };
+        current.count += 1;
+        if (current.rowIndexes.length < 5) current.rowIndexes.push(nodeIndex + 1);
+        bucket.set(normalized, current);
+      });
+    });
+    return Object.entries(collectors).map(([key, bucket]) => ({
+      key,
+      label: getListingFieldLabel(key),
+      expectedFormat: getAiFieldExpectedFormat(key),
+      candidates: Array.from(bucket.values())
+        .sort((a, b) => b.count - a.count || String(a.value).localeCompare(String(b.value), "ja"))
+        .slice(0, 12),
+    })).filter((entry) => entry.candidates.length);
+  }
+
+  function guessAiFieldEvidenceValue(key, text) {
+    const normalized = normalizeNumberText(text || "");
+    if (key === "rent") return extractRentFromText(normalized);
+    if (key === "managementFee") return extractManagementFeeFromText(normalized, "");
+    if (key === "deposit") return extractDepositFromText(normalized);
+    if (key === "keyMoney") return extractKeyMoneyFromText(normalized);
+    if (key === "layout") return extractLayoutFromText(normalized);
+    if (key === "area") return extractAreaFromText(normalized);
+    if (key === "availableDate") {
+      const match = normalized.match(/即入居可?|相談|(?:[0-9]{4}年)?[0-9]{1,2}月[0-9]{1,2}日|[0-9]{1,2}月(?:上旬|中旬|下旬)/);
+      return match ? match[0] : "";
+    }
+    if (key === "ad") {
+      const match = normalized.match(/(?:AD|広告費|広告料)\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?ヶ月|[0-9]+(?:\.[0-9]+)?%|[0-9][0-9,]*円|あり|有|なし)/i);
+      return match ? match[0] : "";
+    }
+    if (key === "room") {
+      const match = normalized.match(/([0-9A-Za-z-]+)\s*号室|部屋番号\s*([0-9A-Za-z-]+)/);
+      return match ? match[1] || match[2] || "" : "";
+    }
+    return "";
+  }
+
+  function isAiSearchOrFilterContainer(node) {
+    const text = normalizeText(node && (node.innerText || node.textContent || "") || "");
+    if (!text) return false;
+    const filterMarkers = ["条件保存", "条件呼び出し", "絞り込み", "所在地で絞り込み", "路線・駅", "物件名（カナ検索可）", "募集条件"];
+    const markerCount = filterMarkers.filter((marker) => text.includes(marker)).length;
+    return markerCount >= 2;
+  }
+
+  function getAiSnippetEntry(node, index, options) {
+    const htmlLimit = options && options.htmlLimit || 8000;
+    const textLimit = options && options.textLimit || 500;
     return {
       index,
       tag: node.tagName.toLowerCase(),
@@ -3104,8 +4147,8 @@
       className: typeof node.className === "string" ? node.className : "",
       stableCssPath: buildStableCssPath(node),
       candidateSelectors: buildAiCandidateSelectors(node),
-      textPreview: truncateText(normalizeText(node.innerText || node.textContent || ""), 500),
-      html: sanitizeHtmlForAi(node),
+      textPreview: truncateText(normalizeText(node.innerText || node.textContent || ""), textLimit),
+      html: sanitizeHtmlForAiWithLimit(node, htmlLimit),
     };
   }
 
@@ -3208,6 +4251,7 @@
     if (!node || !node.cloneNode) return "";
     const clone = node.cloneNode(true);
     clone.querySelectorAll("script, style, svg, canvas, iframe, noscript").forEach((child) => child.remove());
+    removeAiNonContentElements(clone);
     clone.querySelectorAll("*").forEach((child) => {
       sanitizeAiHtmlElement(child);
     });
@@ -3215,6 +4259,48 @@
       sanitizeAiHtmlElement(clone);
     }
     return truncateText((clone.outerHTML || "").replace(/\s+/g, " "), limit);
+  }
+
+  function removeAiNonContentElements(root) {
+    if (!root || !root.querySelectorAll) return;
+    root.querySelectorAll("form, nav, header, footer, aside, [role='search'], [role='navigation'], [aria-label], [class], [id]").forEach((node) => {
+      if (!node || !node.parentElement) return;
+      if (shouldRemoveAiNonContentBlock(node)) node.remove();
+    });
+    root.querySelectorAll("input, textarea, select, option, button, datalist, fieldset, legend").forEach((node) => {
+      if (node && node.parentElement) node.remove();
+    });
+  }
+
+  function shouldRemoveAiNonContentBlock(node) {
+    if (!node || node.closest && node.closest(`#${APP_ID}, #${APP_ID}-modal`)) return true;
+    const tag = node.tagName || "";
+    const text = normalizeText(node.innerText || node.textContent || "");
+    const attrText = normalizeText([
+      node.id || "",
+      typeof node.className === "string" ? node.className : "",
+      node.getAttribute && node.getAttribute("role") || "",
+      node.getAttribute && node.getAttribute("aria-label") || "",
+      node.getAttribute && node.getAttribute("data-testid") || "",
+      node.getAttribute && node.getAttribute("data-test") || "",
+      node.getAttribute && node.getAttribute("data-cy") || "",
+    ].join(" "));
+    if (hasRoomLikeText(text)) return false;
+    if (/^(NAV|HEADER|FOOTER|ASIDE)$/.test(tag)) return true;
+    const searchMarkers = countAiSearchFilterMarkers(`${attrText} ${text}`);
+    if (tag === "FORM" && searchMarkers >= 1) return true;
+    if (searchMarkers >= 2) return true;
+    return false;
+  }
+
+  function countAiSearchFilterMarkers(value) {
+    const text = normalizeNumberText(value).toLowerCase();
+    const markers = [
+      /検索|絞り込み|条件|条件保存|条件呼び出し|募集条件|所在地で絞り込み|路線・駅|駅徒歩|賃料.*万円|専有面積.*㎡/,
+      /\bsearch\b|\bfilter\b|\bfilters\b|\bcondition\b|\bconditions\b|\bsidebar\b|\bdrawer\b|\bnav\b|\bnavigation\b/,
+      /checkbox|radio|combobox|select|pulldown|フォーム|form/,
+    ];
+    return markers.reduce((count, regex) => count + (regex.test(text) ? 1 : 0), 0);
   }
 
   function sanitizeAiHtmlElement(node) {
@@ -3470,7 +4556,10 @@
       config.scopeMode = normalizeListingScopeMode(source.scopeMode);
       applied += 1;
     }
-    const fields = collectAiFieldSpecs(source, report);
+    applyAiStrategyMetadata(config, source, report);
+    const tableApplied = applyAiTableExtractionResponse(config, getAiTableExtractionSpec(source), report);
+    if (tableApplied) applied += tableApplied;
+    const fields = collectAiFieldSpecs(source, report, { allowEmpty: tableApplied > 0 });
     Object.entries(fields).forEach(([rawKey, rawSpec]) => {
       const key = normalizeAiFieldKey(rawKey);
       if (!key) {
@@ -3534,6 +4623,31 @@
     return options && options.collectReport ? { applied, report } : applied;
   }
 
+  function applyAiStrategyMetadata(config, source, report) {
+    const strategy = normalizeAiExtractionStrategy(source.extractionStrategy || source.strategy || source.mode || "");
+    if (strategy) {
+      config.aiMetadata = {
+        ...(config.aiMetadata || {}),
+        extractionStrategy: strategy,
+        selfCheck: source.selfCheck && typeof source.selfCheck === "object" ? clonePlain(source.selfCheck) : null,
+      };
+      report.corrections.push(`AIの抽出方式を記録しました: ${strategy}`);
+    } else if (source.selfCheck && typeof source.selfCheck === "object") {
+      config.aiMetadata = {
+        ...(config.aiMetadata || {}),
+        selfCheck: clonePlain(source.selfCheck),
+      };
+    }
+  }
+
+  function normalizeAiExtractionStrategy(value) {
+    const text = String(value || "").trim();
+    if (/roomCells|room_cells|cell/i.test(text)) return "roomCells";
+    if (/table/i.test(text)) return "tableExtraction";
+    if (/css|selector|card|div/i.test(text)) return "css";
+    return "";
+  }
+
   function createAiReviewReport() {
     return {
       applied: 0,
@@ -3543,6 +4657,8 @@
       fieldScores: [],
       rows: [],
       rowCount: 0,
+      previewRowCount: 0,
+      previewRowTotal: 0,
       itemCount: 0,
       roomCount: 0,
       retryPrompt: "",
@@ -3555,7 +4671,88 @@
     return report;
   }
 
-  function collectAiFieldSpecs(source, report) {
+  function getAiTableExtractionSpec(source) {
+    if (!source || typeof source !== "object") return null;
+    if (source.tableExtraction && typeof source.tableExtraction === "object") return source.tableExtraction;
+    if (source.tableConfig && typeof source.tableConfig === "object") return source.tableConfig;
+    if (source.table && typeof source.table === "object") return source.table;
+    if ((source.tableSelector || source.tableCss || source.table_css) && (source.columns || source.columnMap || source.fieldColumns || source.fields)) return source;
+    return null;
+  }
+
+  function applyAiTableExtractionResponse(config, rawSpec, report) {
+    if (!rawSpec || typeof rawSpec !== "object") return 0;
+    if (rawSpec.enabled === false) {
+      config.tableExtraction = createDefaultTableExtraction();
+      report.corrections.push("テーブル抽出を無効として読み込みました。");
+      return 1;
+    }
+    const normalized = normalizeAiTableExtractionSpec(rawSpec, report);
+    const sanitized = sanitizeTableExtractionConfig({
+      ...createDefaultTableExtraction(),
+      ...normalized,
+      enabled: true,
+      columns: normalized.columns,
+    });
+    if (!sanitized.tableSelector) {
+      report.warnings.push("tableExtraction はありますが tableSelector がないため無視しました。");
+      return 0;
+    }
+    if (!Object.keys(sanitized.columns || {}).length) {
+      report.warnings.push("tableExtraction はありますが columns が空のため無視しました。");
+      return 0;
+    }
+    config.tableExtraction = sanitized;
+    report.corrections.push("テーブル抽出設定を読み込みました。");
+    return 1;
+  }
+
+  function normalizeAiTableExtractionSpec(spec, report) {
+    const modeValue = spec.mode || spec.type || spec.tableMode || "";
+    const tableSelector = getFirstAiString(spec.tableSelector || spec.tableCss || spec.table_css || spec.selector || spec.css, report, "テーブル");
+    const rowSelector = getFirstAiString(spec.rowSelector || spec.trSelector || spec.row || spec.rows, report, "テーブル行");
+    const roomSelector = getFirstAiString(spec.roomSelector || spec.roomCellSelector || spec.roomCells, report, "部屋セル");
+    const cellSelector = getFirstAiString(spec.cellSelector || spec.tdSelector || spec.cells, report, "セル");
+    return {
+      mode: /roomCells|roomCell|cell|rooms/i.test(String(modeValue || "")) ? "roomCells" : "standard",
+      tableSelector: typeof tableSelector === "string" ? tableSelector : "",
+      rowSelector: typeof rowSelector === "string" ? rowSelector : "tr",
+      cellSelector: typeof cellSelector === "string" ? cellSelector : "td,th",
+      headerRowIndex: normalizeTableRowIndex(spec.headerRowIndex != null ? spec.headerRowIndex : spec.headerIndex, 0),
+      dataStartRowIndex: normalizeTableRowIndex(spec.dataStartRowIndex != null ? spec.dataStartRowIndex : spec.dataStartIndex != null ? spec.dataStartIndex : spec.firstDataRowIndex, 1),
+      roomSelector: typeof roomSelector === "string" ? roomSelector : "",
+      buildingNameSelector: typeof spec.buildingNameSelector === "string" ? spec.buildingNameSelector : typeof spec.propertyNameSelector === "string" ? spec.propertyNameSelector : "",
+      excludeColumns: Array.isArray(spec.excludeColumns) ? spec.excludeColumns : [],
+      columns: normalizeAiTableColumns(spec.columns || spec.columnMap || spec.fieldColumns || spec.fields || spec, report),
+    };
+  }
+
+  function normalizeAiTableColumns(rawColumns, report) {
+    const columns = {};
+    if (Array.isArray(rawColumns)) {
+      rawColumns.forEach((entry) => {
+        if (!entry || typeof entry !== "object") return;
+        const key = normalizeTableColumnKey(entry.key || entry.field || entry.name || entry.label);
+        if (!key) {
+          report.warnings.push(`未対応のテーブル列を無視しました: ${entry.key || entry.field || entry.name || entry.label || "名称なし"}`);
+          return;
+        }
+        columns[key] = normalizeTableColumnSpec(entry, key);
+      });
+      return columns;
+    }
+    if (!rawColumns || typeof rawColumns !== "object") return columns;
+    Object.entries(rawColumns).forEach(([rawKey, value]) => {
+      if (["enabled", "mode", "type", "tableSelector", "tableCss", "table_css", "selector", "css", "rowSelector", "trSelector", "row", "rows", "cellSelector", "tdSelector", "cells", "headerRowIndex", "headerIndex", "dataStartRowIndex", "dataStartIndex", "firstDataRowIndex", "roomSelector", "roomCellSelector", "roomCells", "buildingNameSelector", "propertyNameSelector", "excludeColumns"].includes(rawKey)) return;
+      const key = normalizeTableColumnKey(rawKey);
+      if (!key) return;
+      const spec = normalizeTableColumnSpec(value, key);
+      if (spec) columns[key] = spec;
+    });
+    return columns;
+  }
+
+  function collectAiFieldSpecs(source, report, options) {
     const fields = { ...(source.fields || source.fieldRules || source.fieldSelectors || {}) };
     if (source.selectors && typeof source.selectors === "object" && !Array.isArray(source.selectors)) {
       Object.entries(source.selectors).forEach(([key, value]) => {
@@ -3566,7 +4763,7 @@
     getListingFieldIds().forEach(({ key }) => {
       if (source[key] != null && fields[key] == null) fields[key] = source[key];
     });
-    if (!Object.keys(fields).length) report.warnings.push("fields / selectors に項目別設定が見つかりません。");
+    if (!Object.keys(fields).length && !(options && options.allowEmpty)) report.warnings.push("fields / selectors に項目別設定が見つかりません。");
     return fields;
   }
 
@@ -3639,29 +4836,150 @@
       if (report.roomCount === 0) report.warnings.push(`1部屋のまとまりが0件です: ${config.rowSelector}`);
       addSelectorQualityWarnings(config.rowSelector, "1部屋のまとまり", report);
     }
+    validateTableExtractionForAiReview(config, report);
+    const tableRowsAvailable = extractTableBasedListingRows(config).length > 0;
     getListingFieldIds().forEach(({ key, label }) => {
       const field = config.fields && config.fields[key];
-      if (!field || !hasConfiguredFieldInput(field)) {
+      const hasTableField = isTableExtractionConfiguredForField(config, key);
+      if ((!field || !hasConfiguredFieldInput(field)) && !hasTableField) {
         if (key !== "availableDate" && key !== "ad") report.warnings.push(`${label} の取得設定がありません。`);
         return;
       }
       report.fieldScores.push(scoreAiConfiguredField(config, key, label));
-      (field.rules || []).forEach((rule) => {
+      if (hasTableField && tableRowsAvailable) return;
+      ((field && field.rules) || []).forEach((rule) => {
         if (rule && rule.type === "selector" && rule.selector) {
           validateSelectorForAiReview(rule.selector, label, report);
           addSelectorQualityWarnings(rule.selector, label, report);
         }
       });
     });
-    report.rows = extractRuleBasedListingRows(config).slice(0, 12);
-    report.rowCount = report.rows.length;
+    const previewRows = extractRowsForListingConfig(config);
+    previewRows.forEach((row) => {
+      row._fieldIssues = buildAiRowFieldIssues(row);
+    });
+    report.rowCount = previewRows.length;
+    report.previewRowTotal = previewRows.length;
+    report.rows = previewRows.slice(0, AI_PREVIEW_ROW_LIMIT);
+    report.previewRowCount = report.rows.length;
     if (!report.rowCount) report.errors.push("この設定ではテーブル行を作れませんでした。1物件/1部屋のまとまり、または各項目のCSSを見直してください。");
+    applyAiSelfCheckWarnings(config, report);
+    addAiRowIssueWarnings(report);
     report.fieldScores.forEach((score) => {
+      const requiredField = !["availableDate", "ad"].includes(score.key);
       if (score.configured && score.valueCount === 0) report.warnings.push(`${score.label} は設定済みですが取得値が0件です。`);
-      if (score.configured && score.valueCount > 0 && score.formatOkCount === 0 && score.requiresFormat) report.warnings.push(`${score.label} は取得値の形式が項目に合っていない可能性があります。`);
+      if (score.configured && score.valueCount > 0 && score.formatOkCount === 0 && score.requiresFormat) {
+        const message = `${score.label} は取得値の形式が項目に合っていません。`;
+        if (requiredField) report.errors.push(message);
+        else report.warnings.push(message);
+      }
+      if (score.configured && requiredField && score.issueReasons && score.issueReasons.some((reason) => reason.includes("別項目の値"))) {
+        report.errors.push(`${score.label} は別項目の値を拾っている可能性があります。`);
+      }
       if (score.configured && score.sameValueCount >= 3 && score.valueCount >= 4 && score.uniqueCount <= 1) report.warnings.push(`${score.label} が全行ほぼ同じ値です。広すぎるセレクタの可能性があります。`);
     });
     return report;
+  }
+
+  function applyAiSelfCheckWarnings(config, report) {
+    const selfCheck = config && config.aiMetadata && config.aiMetadata.selfCheck;
+    if (!selfCheck || typeof selfCheck !== "object") return;
+    const expected = Number(selfCheck.expectedRowCount || selfCheck.rowCount || selfCheck.expectedRows);
+    if (Number.isFinite(expected) && expected >= 0) {
+      const diff = Math.abs((report.rowCount || 0) - expected);
+      if (diff >= Math.max(2, Math.ceil(expected * 0.3))) {
+        report.warnings.push(`AIの想定行数 ${expected}件 に対して、仮プレビューは ${report.rowCount || 0}件です。行のまとまりがズレている可能性があります。`);
+      }
+    }
+    const uncertainFields = Array.isArray(selfCheck.uncertainFields) ? selfCheck.uncertainFields.filter(Boolean) : [];
+    if (uncertainFields.length) report.warnings.push(`AIが自信低めとした項目: ${uncertainFields.slice(0, 8).join(" / ")}`);
+  }
+
+  function addAiRowIssueWarnings(report) {
+    const rows = Array.isArray(report && report.rows) ? report.rows : [];
+    const issueRows = rows.filter((row) => row && row._fieldIssues && Object.keys(row._fieldIssues).length);
+    if (!issueRows.length) return;
+    report.warnings.push(`行単位の確認点が ${issueRows.length}/${rows.length}件あります。仮プレビューの強調セルを確認してください。`);
+    issueRows.slice(0, 5).forEach((row) => {
+      const labels = Object.keys(row._fieldIssues).map(getListingFieldLabel).join(" / ");
+      report.warnings.push(`${row.index || "?"}行目: ${labels} を確認してください。`);
+    });
+  }
+
+  function buildAiRowFieldIssues(row) {
+    const issues = {};
+    getListingFieldIds().forEach(({ key, label }) => {
+      const value = normalizeText(row && row[key] || "");
+      if (!value || key === "buildingName") return;
+      const raw = row && row._rawValues && (row._rawValues[key] || row._rawValues.rowText) || value;
+      if (!isAiFieldValueFormatOk(key, value, raw)) {
+        issues[key] = `${label}の値が想定形式と違う可能性があります: ${truncateText(value, 40)}`;
+      }
+    });
+    if (row && isFloorOnlyRoomValue(row.room || "")) {
+      issues.room = "号室ではなく階数だけを拾っている可能性があります。";
+    }
+    if (row && row.rent && row.managementFee) {
+      const rent = parseJapaneseYenAmount(row.rent, { allowManYen: true, assumeYenForPlainNumber: true });
+      const fee = parseJapaneseYenAmount(row.managementFee, { allowManYen: true, assumeYenForPlainNumber: true });
+      if (rent && fee && fee >= rent) issues.managementFee = "管理費が賃料以上です。賃料と管理費を取り違えている可能性があります。";
+    }
+    return issues;
+  }
+
+  function buildListingConfigDiffSummary(beforeConfig, afterConfig) {
+    const diffs = [];
+    if ((beforeConfig.itemSelector || "") !== (afterConfig.itemSelector || "")) {
+      diffs.push(`1物件CSS: ${truncateText(beforeConfig.itemSelector || "未設定", 60)} → ${truncateText(afterConfig.itemSelector || "未設定", 60)}`);
+    }
+    if ((beforeConfig.rowSelector || "") !== (afterConfig.rowSelector || "")) {
+      diffs.push(`1部屋CSS: ${truncateText(beforeConfig.rowSelector || "未設定", 60)} → ${truncateText(afterConfig.rowSelector || "未設定", 60)}`);
+    }
+    const beforeTable = serializeAiTableExtractionConfig(beforeConfig.tableExtraction);
+    const afterTable = serializeAiTableExtractionConfig(afterConfig.tableExtraction);
+    if (JSON.stringify(beforeTable) !== JSON.stringify(afterTable)) {
+      diffs.push(`テーブル抽出: ${beforeTable.enabled ? "有効" : "無効"} → ${afterTable.enabled ? "有効" : "無効"}`);
+      if ((beforeTable.tableSelector || "") !== (afterTable.tableSelector || "")) {
+        diffs.push(`テーブルCSS: ${truncateText(beforeTable.tableSelector || "未設定", 60)} → ${truncateText(afterTable.tableSelector || "未設定", 60)}`);
+      }
+    }
+    getListingFieldIds().forEach(({ key, label }) => {
+      const beforeRule = serializeFieldPrimaryRuleForDiff(beforeConfig, key);
+      const afterRule = serializeFieldPrimaryRuleForDiff(afterConfig, key);
+      if (beforeRule !== afterRule) diffs.push(`${label}: ${truncateText(beforeRule || "未設定", 80)} → ${truncateText(afterRule || "未設定", 80)}`);
+    });
+    return diffs.slice(0, 16);
+  }
+
+  function serializeFieldPrimaryRuleForDiff(config, key) {
+    const field = config && config.fields && config.fields[key];
+    if (!field) return "";
+    const selectorRule = getListingFieldRule(field, "selector");
+    const regexRule = getListingFieldRule(field, "regex");
+    return JSON.stringify({
+      scope: selectorRule && selectorRule.scope || "",
+      selector: selectorRule && selectorRule.selector || "",
+      regex: regexRule && (regexRule.pattern || regexRule.regex) || selectorRule && (selectorRule.pattern || selectorRule.regex) || "",
+      lineMode: selectorRule && selectorRule.lineMode || "",
+      normalizer: selectorRule && selectorRule.normalizer || "",
+    });
+  }
+
+  function addAdoptionRiskWarnings(beforeConfig, afterConfig, report) {
+    if (!report) return;
+    const beforeRows = extractRowsForListingConfig(beforeConfig);
+    const afterRows = Array.isArray(report.rows) ? report.rows : extractRowsForListingConfig(afterConfig);
+    if (beforeRows.length >= 3 && afterRows.length < Math.max(1, Math.floor(beforeRows.length * 0.6))) {
+      report.warnings.push(`採用前確認: 現在設定では ${beforeRows.length}件、仮設定では ${afterRows.length}件です。行数が大きく減っています。`);
+    }
+    const importantKeys = ["room", "rent", "layout", "area"];
+    importantKeys.forEach((key) => {
+      const beforeCount = beforeRows.filter((row) => normalizeText(row && row[key] || "")).length;
+      const afterCount = afterRows.filter((row) => normalizeText(row && row[key] || "")).length;
+      if (beforeCount >= 3 && afterCount < Math.max(1, Math.floor(beforeCount * 0.5))) {
+        report.warnings.push(`採用前確認: ${getListingFieldLabel(key)} の取得件数が ${beforeCount}件 → ${afterCount}件 に減っています。`);
+      }
+    });
   }
 
   function validateSelectorForAiReview(selector, label, report) {
@@ -3691,6 +5009,8 @@
 
   function countConfiguredRoomsForAiReview(config) {
     try {
+      const tableCount = countTableExtractionRowsForAiReview(config);
+      if (tableCount) return tableCount;
       return getConfiguredItemScopes(config).reduce((sum, item) => sum + getConfiguredRowScopes(item, config).length, 0);
     } catch (error) {
       return 0;
@@ -3698,16 +5018,36 @@
   }
 
   function scoreAiConfiguredField(config, key, label) {
+    if (isTableExtractionConfiguredForField(config, key)) return scoreAiTableConfiguredField(config, key, label);
     const field = config.fields && config.fields[key];
     const contexts = getListingPreviewContexts(config).slice(0, 20);
     const values = [];
+    const rawValues = [];
+    const emptyReasons = [];
     contexts.forEach((context) => {
       const value = extractConfiguredField(key, field, context, {});
       if (value) values.push(value);
+      const preview = field ? getConfiguredFieldFormatPreview(key, field, context, config) : null;
+      if (preview && preview.raw) rawValues.push(preview.raw);
+      if (!value) emptyReasons.push(getConfiguredFieldEmptyReason(key, field, context, config));
     });
     const uniqueValues = Array.from(new Set(values.map((value) => normalizeText(value))));
     const requiresFormat = ["room", "rent", "managementFee", "deposit", "keyMoney", "availableDate", "ad", "layout", "area"].includes(key);
-    const formatOkCount = values.filter((value) => isAiFieldValueFormatOk(key, value)).length;
+    const formatOkCount = values.filter((value, index) => isAiFieldValueFormatOk(key, value, rawValues[index] || "")).length;
+    const selectorRule = field ? getListingFieldRule(field, "selector") : null;
+    const regexRule = field ? getListingFieldRule(field, "regex") : null;
+    const issueReasons = buildAiFieldIssueReasons(key, {
+      configured: hasConfiguredFieldInput(field),
+      contextCount: contexts.length,
+      valueCount: values.length,
+      uniqueCount: uniqueValues.length,
+      formatOkCount,
+      requiresFormat,
+      selectorRule,
+      emptyReasons,
+      values,
+      rawValues,
+    });
     return {
       key,
       label,
@@ -3720,28 +5060,311 @@
       requiresFormat,
       score: calculateAiFieldScore(values.length, contexts.length, uniqueValues.length, formatOkCount, requiresFormat),
       samples: values.slice(0, 3),
+      rawSamples: rawValues.slice(0, 3),
+      emptyReasons: Array.from(new Set(emptyReasons.filter(Boolean))).slice(0, 4),
+      issueReasons,
+      currentRule: serializeAiFieldRuleForRetry(selectorRule, regexRule, key),
+      instruction: buildAiFieldRetryInstruction(key, label, issueReasons),
     };
+  }
+
+  function validateTableExtractionForAiReview(config, report) {
+    const tableConfig = config && config.tableExtraction ? sanitizeTableExtractionConfig(config.tableExtraction) : null;
+    if (!tableConfig || tableConfig.enabled !== true) return;
+    if (!tableConfig.tableSelector) {
+      report.errors.push("テーブル抽出が有効ですが、tableSelector がありません。");
+      return;
+    }
+    validateSelectorForAiReview(tableConfig.tableSelector, "テーブル", report);
+    if (tableConfig.rowSelector) validateSelectorForAiReview(tableConfig.rowSelector, "テーブル行", report);
+    if (tableConfig.roomSelector) validateSelectorForAiReview(tableConfig.roomSelector, "部屋セル", report);
+    if (tableConfig.buildingNameSelector) validateSelectorForAiReview(tableConfig.buildingNameSelector, "物件名", report);
+    const tableCount = tableConfig.tableSelector && isSelectorValidForPreview(tableConfig.tableSelector)
+      ? safeQuerySelectorAll(document, tableConfig.tableSelector).length
+      : 0;
+    if (!tableCount) report.errors.push(`テーブルが0件です: ${tableConfig.tableSelector}`);
+    if (!Object.keys(tableConfig.columns || {}).length) report.errors.push("テーブル抽出の columns が空です。");
+  }
+
+  function countTableExtractionRowsForAiReview(config) {
+    const tableConfig = config && config.tableExtraction ? sanitizeTableExtractionConfig(config.tableExtraction) : null;
+    if (!tableConfig || tableConfig.enabled !== true) return 0;
+    if (tableConfig.mode === "roomCells") {
+      return getTableExtractionRoots(tableConfig).reduce((sum, root) => sum + getRoomCellTableRowNodes(root, tableConfig).length, 0);
+    }
+    return getTableExtractionRoots(tableConfig).reduce((sum, table) => {
+      return sum + Math.max(0, getStandardTableRowNodes(table, tableConfig).length - tableConfig.dataStartRowIndex);
+    }, 0);
+  }
+
+  function isTableExtractionConfiguredForField(config, key) {
+    const tableConfig = config && config.tableExtraction ? sanitizeTableExtractionConfig(config.tableExtraction) : null;
+    if (!tableConfig || tableConfig.enabled !== true) return false;
+    const columns = tableConfig.columns || {};
+    if (columns[key]) return true;
+    return (key === "deposit" || key === "keyMoney") && Boolean(columns.depositKeyMoney);
+  }
+
+  function scoreAiTableConfiguredField(config, key, label) {
+    const rows = extractTableBasedListingRows(config).slice(0, 20);
+    const values = rows.map((row) => row[key]).filter(Boolean);
+    const rawValues = rows.map((row) => {
+      if (!row || !row._rawValues) return "";
+      return row._rawValues[key] || ((key === "deposit" || key === "keyMoney") ? row._rawValues.depositKeyMoney : "") || row._rawValues.rowText || "";
+    }).filter(Boolean);
+    const uniqueValues = Array.from(new Set(values.map((value) => normalizeText(value))));
+    const requiresFormat = ["room", "rent", "managementFee", "deposit", "keyMoney", "availableDate", "ad", "layout", "area"].includes(key);
+    const formatOkCount = values.filter((value, index) => isAiFieldValueFormatOk(key, value, rawValues[index] || value)).length;
+    const issueReasons = buildAiFieldIssueReasons(key, {
+      configured: true,
+      contextCount: rows.length,
+      valueCount: values.length,
+      uniqueCount: uniqueValues.length,
+      formatOkCount,
+      requiresFormat,
+      selectorRule: null,
+      emptyReasons: rows.length && !values.length ? ["テーブル列から値を作れません"] : [],
+      values,
+      rawValues,
+    });
+    return {
+      key,
+      label,
+      configured: true,
+      contextCount: rows.length,
+      valueCount: values.length,
+      uniqueCount: uniqueValues.length,
+      sameValueCount: values.length - uniqueValues.length,
+      formatOkCount,
+      requiresFormat,
+      score: calculateAiFieldScore(values.length, rows.length, uniqueValues.length, formatOkCount, requiresFormat),
+      samples: values.slice(0, 3),
+      rawSamples: rawValues.slice(0, 3),
+      emptyReasons: rows.length && !values.length ? ["テーブル列から値を作れません"] : [],
+      issueReasons,
+      currentRule: serializeAiTableFieldRuleForRetry(config, key),
+      instruction: buildAiFieldRetryInstruction(key, label, issueReasons),
+    };
+  }
+
+  function serializeAiTableFieldRuleForRetry(config, key) {
+    const tableConfig = config && config.tableExtraction ? sanitizeTableExtractionConfig(config.tableExtraction) : createDefaultTableExtraction();
+    const columns = tableConfig.columns || {};
+    const relevantColumns = {};
+    if (columns[key]) relevantColumns[key] = columns[key];
+    if ((key === "deposit" || key === "keyMoney") && columns.depositKeyMoney) relevantColumns.depositKeyMoney = columns.depositKeyMoney;
+    return {
+      tableExtraction: {
+        enabled: true,
+        mode: tableConfig.mode,
+        tableSelector: tableConfig.tableSelector,
+        rowSelector: tableConfig.rowSelector,
+        cellSelector: tableConfig.cellSelector,
+        dataStartRowIndex: tableConfig.dataStartRowIndex,
+        roomSelector: tableConfig.roomSelector,
+        columns: relevantColumns,
+      },
+    };
+  }
+
+  function buildAiFieldIssueReasons(key, info) {
+    const issues = [];
+    if (!info.configured) issues.push("項目の取得設定がありません。");
+    if (info.selectorRule && info.selectorRule.selector && !isSelectorValidForPreview(info.selectorRule.selector)) {
+      issues.push(`CSSセレクタが不正です: ${info.selectorRule.selector}`);
+    }
+    if (info.configured && info.valueCount === 0) {
+      issues.push(`取得値が0件です。理由例: ${info.emptyReasons.filter(Boolean).slice(0, 2).join(" / ") || "不明"}`);
+    }
+    if (info.configured && info.contextCount && info.valueCount > 0 && info.valueCount < info.contextCount) {
+      issues.push(`一部の行で未取得です: ${info.valueCount}/${info.contextCount}件`);
+    }
+    if (info.configured && info.valueCount > 0 && info.requiresFormat && info.formatOkCount === 0) {
+      issues.push(`取得値が${getAiFieldExpectedFormat(key)}の形式に合っていません。`);
+    }
+    if (info.configured && info.valueCount > 0 && info.requiresFormat && info.formatOkCount > 0 && info.formatOkCount < info.valueCount) {
+      issues.push(`形式に合わない値が混ざっています: ${info.formatOkCount}/${info.valueCount}件だけ正常`);
+    }
+    const wrongTypeSamples = getWrongTypeSamplesForAiField(key, info.values || [], info.rawValues || [], info.selectorRule);
+    if (wrongTypeSamples.length) {
+      issues.push(`別項目の値を拾っている可能性があります: ${wrongTypeSamples.join(" / ")}`);
+    }
+    if (info.configured && info.valueCount >= 4 && info.uniqueCount <= 1 && key !== "buildingName") {
+      issues.push("全行で同じ値になっています。セレクタが広すぎるか、物件/部屋のスコープが違う可能性があります。");
+    }
+    if (info.selectorRule && info.selectorRule.selector && (info.selectorRule.selector.match(/:nth-child|:nth-of-type/g) || []).length >= 3) {
+      issues.push("nth-childが多く、安定しないセレクタです。class/data属性/見出し近くの構造を優先してください。");
+    }
+    return issues;
+  }
+
+  function serializeAiFieldRuleForRetry(selectorRule, regexRule, key) {
+    return {
+      scope: selectorRule && selectorRule.scope || getDefaultListingScope(key, getListingExtractorConfig()),
+      selector: selectorRule && selectorRule.selector || "",
+      selectorCandidates: selectorRule && selectorRule.aiManagedFallback ? [selectorRule.selector || ""] : undefined,
+      lineMode: selectorRule && selectorRule.lineMode || "",
+      normalizer: selectorRule && selectorRule.normalizer || getDefaultListingNormalizer(key),
+      regex: regexRule && (regexRule.pattern || regexRule.regex) || selectorRule && (selectorRule.pattern || selectorRule.regex) || "",
+      group: regexRule && Number.isInteger(regexRule.group) ? regexRule.group : selectorRule && Number.isInteger(selectorRule.group) ? selectorRule.group : 1,
+    };
+  }
+
+  function buildAiFieldRetryInstruction(key, label, issues) {
+    if (!issues.length) return `${label}は大きな問題がなければ変更しないでください。`;
+    const expected = getAiFieldExpectedFormat(key);
+    const scopeHint = key === "buildingName" ? "1物件内(item)" : "1部屋内(row)";
+    return `${label}だけを重点的に直してください。${scopeHint}から、${expected}として使える値だけを返すselector/regex/lineMode/normalizerにしてください。`;
+  }
+
+  function getAiFieldExpectedFormat(key) {
+    const formats = {
+      buildingName: "物件名テキスト",
+      room: "号室",
+      rent: "円表記の賃料",
+      managementFee: "円表記の管理費",
+      deposit: "ヶ月または円表記の敷金",
+      keyMoney: "ヶ月または円表記の礼金",
+      availableDate: "入居日、即入居、相談など",
+      ad: "AD/広告料の値。なければ未記載",
+      layout: "1K/1LDKなどの間取り",
+      area: "㎡表記の面積",
+    };
+    return formats[key] || "項目に合う値";
   }
 
   function calculateAiFieldScore(valueCount, contextCount, uniqueCount, formatOkCount, requiresFormat) {
     if (!contextCount) return 0;
-    let score = Math.round((valueCount / contextCount) * 60);
-    if (!requiresFormat || formatOkCount) score += Math.round((formatOkCount || valueCount) / Math.max(1, valueCount) * 25);
-    if (uniqueCount > 1 || valueCount <= 2) score += 15;
+    const coverageScore = Math.round((valueCount / contextCount) * 45);
+    const formatRate = requiresFormat ? (formatOkCount / Math.max(1, valueCount)) : 1;
+    const formatScore = Math.round(formatRate * 40);
+    const varietyScore = uniqueCount > 1 || valueCount <= 2 ? 15 : 0;
+    let score = coverageScore + formatScore + varietyScore;
+    if (requiresFormat && valueCount > 0 && formatOkCount < valueCount) score = Math.min(score, 84);
+    if (requiresFormat && valueCount > 0 && formatOkCount === 0) score = Math.min(score, 45);
     return Math.max(0, Math.min(100, score));
   }
 
-  function isAiFieldValueFormatOk(key, value) {
+  function isAiFieldValueFormatOk(key, value, rawValue) {
     const text = normalizeText(value);
+    const raw = normalizeText(rawValue || value);
     if (!text) return false;
-    if (key === "room") return /号室|^\d{2,5}$|^\d+[A-Za-z]?$/.test(text);
-    if (key === "rent" || key === "managementFee") return /円|無料|なし|無し|0/.test(text);
-    if (key === "deposit" || key === "keyMoney") return /ヶ月|円|なし|無し|無料|不要|0/.test(text);
-    if (key === "area") return /㎡|m2|m²/.test(text);
-    if (key === "layout") return /\d?R|K|DK|LDK|SLDK|ワンルーム/.test(text);
-    if (key === "availableDate") return /即|相談|予定|入居|年|月|旬|空/.test(text);
-    if (key === "ad") return /未記載|%|ヶ月|円|AD|広告/.test(text);
+    if (key === "buildingName") return !hasAnyAiFieldToken(raw, ["money", "area", "layout", "date", "ad"]) && text.length >= 2;
+    if (key === "room") return isExpectedRoomValue(text, raw);
+    if (key === "rent") return isExpectedYenValue(text, raw, { allowZero: false, max: 10000000, label: "rent" });
+    if (key === "managementFee") return isExpectedYenValue(text, raw, { allowZero: true, max: 500000, label: "fee" });
+    if (key === "deposit" || key === "keyMoney") return isExpectedLeaseCostValue(text, raw);
+    if (key === "area") return isExpectedAreaValue(text, raw);
+    if (key === "layout") return isExpectedLayoutValue(text, raw);
+    if (key === "availableDate") return isExpectedAvailableDateValue(text, raw);
+    if (key === "ad") return isExpectedAdValue(text, raw);
     return true;
+  }
+
+  function isExpectedRoomValue(value, rawValue) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    const raw = normalizeNumberText(rawValue);
+    if (hasAnyAiFieldToken(raw, ["money", "area", "layout", "ad"])) return false;
+    return /号室$/.test(text) || /^[0-9]{2,5}[A-Za-z]?$/.test(text);
+  }
+
+  function isExpectedYenValue(value, rawValue, options) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    const raw = normalizeNumberText(rawValue);
+    if (hasAnyAiFieldToken(raw, ["area", "layout", "date", "ad"])) return false;
+    if (!options.allowZero && /^(0円|なし|無し|無料|不要|-)$/.test(text)) return false;
+    if (!/^[0-9][0-9,]*円$/.test(text)) return false;
+    const amount = parseIntegerAmount(text.replace(/円$/, ""));
+    if (amount == null) return false;
+    if (!options.allowZero && amount <= 0) return false;
+    if (amount < 0 || amount > options.max) return false;
+    if (options.label === "rent" && amount < 10000) return false;
+    return true;
+  }
+
+  function isExpectedLeaseCostValue(value, rawValue) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    const raw = normalizeNumberText(rawValue);
+    if (hasAnyAiFieldToken(raw, ["area", "layout", "date", "ad"])) return false;
+    if (/^(なし|無し|無|無料|不要|-|0|0円|0ヶ月)$/.test(text)) return true;
+    if (/^[0-9]+(?:\.[0-9]+)?(?:ヶ月|か月|ヵ月|カ月|ケ月)$/.test(text)) return true;
+    if (/^[0-9][0-9,]*円$/.test(text)) return true;
+    return false;
+  }
+
+  function isExpectedAreaValue(value, rawValue) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    const raw = normalizeNumberText(rawValue);
+    if (hasAnyAiFieldToken(raw, ["money", "layout", "date", "ad"])) return false;
+    const match = text.match(/^([0-9]+(?:\.[0-9]+)?)㎡$/);
+    if (!match) return false;
+    const area = Number(match[1]);
+    return Number.isFinite(area) && area >= 5 && area <= 300;
+  }
+
+  function isExpectedLayoutValue(value, rawValue) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "").toUpperCase();
+    const raw = normalizeNumberText(rawValue);
+    if (hasAnyAiFieldToken(raw, ["money", "area", "date", "ad"])) return false;
+    return /^(?:ワンルーム|[1-9][0-9]?(?:R|K|DK|LDK|SLDK|SDK|SK))$/.test(text);
+  }
+
+  function isExpectedAvailableDateValue(value, rawValue) {
+    const text = normalizeNumberText(value);
+    const raw = normalizeNumberText(rawValue);
+    if (hasAnyAiFieldToken(raw, ["money", "area", "layout", "ad"])) return false;
+    return /即|相談|入居|空|予定|[0-9]{4}年|[0-9]{1,2}月|上旬|中旬|下旬/.test(text);
+  }
+
+  function isExpectedAdValue(value, rawValue) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    const raw = normalizeNumberText(rawValue);
+    if (text === "未記載") return !/\bAD\b|広告料|広告費/i.test(raw) || /未記載|なし|無し|無/.test(raw);
+    if (!/\bAD\b|広告料|広告費/i.test(raw)) return false;
+    if (hasAnyAiFieldToken(raw, ["area", "layout", "date"])) return false;
+    return /^[0-9]+(?:\.[0-9]+)?(?:%|％|ヶ月|か月|ヵ月|カ月|ケ月|円)?$/.test(text) || /あり|有|相談/.test(text);
+  }
+
+  function hasAnyAiFieldToken(text, tokenTypes) {
+    const raw = normalizeNumberText(text);
+    return tokenTypes.some((type) => {
+      if (type === "money") return /[0-9][0-9,.]*\s*(?:万(?:円)?|円)|賃料|家賃|管理費|共益費/.test(raw);
+      if (type === "area") return /[0-9]+(?:\.[0-9]+)?\s*(?:㎡|m2|m²|平米)|面積|専有/.test(raw);
+      if (type === "layout") return /(?:^|[^A-Z0-9])(?:[1-9][0-9]?\s*(?:SLDK|LDK|SDK|DK|SK|R|K)|ワンルーム)(?:$|[^A-Z])/i.test(raw) || /間取り/.test(raw);
+      if (type === "date") return /即入居|入居|相談|[0-9]{4}年|[0-9]{1,2}月|上旬|中旬|下旬/.test(raw);
+      if (type === "ad") return /\bAD\b|広告料|広告費/i.test(raw);
+      return false;
+    });
+  }
+
+  function getWrongTypeSamplesForAiField(key, values, rawValues, selectorRule) {
+    const samples = [];
+    const selector = selectorRule && selectorRule.selector ? selectorRule.selector : "";
+    const selectorToken = getSelectorWrongTypeHint(key, selector);
+    if (selectorToken) samples.push(selectorToken);
+    values.forEach((value, index) => {
+      const raw = rawValues[index] || value;
+      if (!isAiFieldValueFormatOk(key, value, raw)) {
+        samples.push(`${truncateText(raw, 40)} → ${truncateText(value, 40)}`);
+      }
+    });
+    return Array.from(new Set(samples)).slice(0, 3);
+  }
+
+  function getSelectorWrongTypeHint(key, selector) {
+    const text = String(selector || "").toLowerCase();
+    if (!text) return "";
+    const hints = [
+      ["area", /area|m2|m²|meter|㎡|専有|面積/],
+      ["layout", /layout|madori|間取り|roomtype/],
+      ["rent", /rent|price|賃料|家賃/],
+      ["managementFee", /management|fee|common|管理|共益/],
+      ["availableDate", /available|date|入居|空室/],
+      ["ad", /advert|ad|広告/],
+      ["room", /room|number|号室|部屋/],
+    ];
+    const matched = hints.find(([candidateKey, pattern]) => candidateKey !== key && pattern.test(text));
+    return matched ? `selector名が${getListingFieldLabel(matched[0])}系に見えます: ${selector}` : "";
   }
 
   function renderAiReviewPanel(container, report) {
@@ -3755,19 +5378,24 @@
     const status = el("div", "rech-ai-review-status");
     const statusText = report.errors.length ? "要修正" : report.warnings.length ? "確認あり" : "採用可能";
     status.dataset.state = report.errors.length ? "error" : report.warnings.length ? "warning" : "ok";
+    const previewRowCount = report.previewRowCount || report.rows.length || 0;
+    const previewRowTotal = report.previewRowTotal || report.rowCount || previewRowCount;
+    const tableCountText = previewRowTotal > previewRowCount ? `表 ${previewRowCount}/${previewRowTotal}件表示` : `表 ${previewRowTotal}件`;
     status.appendChild(el("strong", "", statusText));
-    status.appendChild(el("span", "", `反映候補 ${report.applied || 0}件 / 表 ${report.rowCount || 0}件 / 物件 ${report.itemCount || 0}件 / 部屋 ${report.roomCount || 0}件`));
+    status.appendChild(el("span", "", `反映候補 ${report.applied || 0}件 / ${tableCountText} / 物件 ${report.itemCount || 0}件 / 部屋 ${report.roomCount || 0}件`));
     container.appendChild(status);
-    if (report.corrections.length) container.appendChild(renderAiReviewList("自動補正", report.corrections, "correction"));
-    if (report.errors.length) container.appendChild(renderAiReviewList("エラー", report.errors, "error"));
-    if (report.warnings.length) container.appendChild(renderAiReviewList("警告", report.warnings, "warning"));
-    if (report.fieldScores.length) container.appendChild(renderAiFieldScoreTable(report.fieldScores));
     if (report.rows.length) {
       const preview = el("div", "rech-ai-table-preview");
-      preview.appendChild(el("strong", "", "仮プレビュー"));
+      preview.appendChild(el("strong", "", previewRowTotal > previewRowCount ? `仮プレビュー（${previewRowCount}/${previewRowTotal}件）` : `仮プレビュー（${previewRowCount}件）`));
+      if (previewRowTotal > previewRowCount) preview.appendChild(el("small", "rech-ai-preview-note", `先頭${previewRowCount}件を表示しています。`));
       preview.appendChild(renderListingTable(report.rows));
       container.appendChild(preview);
     }
+    if (report.corrections.length) container.appendChild(renderAiReviewList("自動補正", report.corrections, "correction"));
+    if (report.configDiffs && report.configDiffs.length) container.appendChild(renderAiReviewList("設定差分", report.configDiffs, "correction"));
+    if (report.errors.length) container.appendChild(renderAiReviewList("エラー", report.errors, "error"));
+    if (report.warnings.length) container.appendChild(renderAiReviewList("警告", report.warnings, "warning"));
+    if (report.fieldScores.length) container.appendChild(renderAiFieldScoreTable(report.fieldScores, report));
   }
 
   function renderAiReviewList(title, items, state) {
@@ -3780,22 +5408,41 @@
     return wrapper;
   }
 
-  function renderAiFieldScoreTable(scores) {
+  function renderAiFieldScoreTable(scores, report) {
     const wrapper = el("div", "rech-ai-score");
     wrapper.appendChild(el("strong", "", "項目別の採点"));
+    wrapper.appendChild(el("small", "rech-ai-score-note", "修正依頼に含める項目だけチェックしてください。正しい項目は警告が出ていても外せます。"));
+    const defaultTargets = new Set(getAiRetryTargetFields(report).map((score) => score.key));
+    if (!Array.isArray(report.retryFieldKeys)) {
+      report.retryFieldKeys = Array.from(defaultTargets);
+    }
     const table = el("table", "rech-ai-score-table");
     const thead = document.createElement("thead");
     const head = document.createElement("tr");
-    ["項目", "点", "取得", "形式", "例"].forEach((label) => head.appendChild(el("th", "", label)));
+    ["修正", "項目", "点", "取得", "形式", "問題", "例"].forEach((label) => head.appendChild(el("th", "", label)));
     thead.appendChild(head);
     table.appendChild(thead);
     const tbody = document.createElement("tbody");
     scores.forEach((score) => {
       const tr = document.createElement("tr");
+      const checkCell = document.createElement("td");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = report.retryFieldKeys.includes(score.key);
+      checkbox.title = `${score.label}を修正依頼に含める`;
+      checkbox.addEventListener("change", () => {
+        const selected = new Set(report.retryFieldKeys || []);
+        if (checkbox.checked) selected.add(score.key);
+        else selected.delete(score.key);
+        report.retryFieldKeys = Array.from(selected);
+      });
+      checkCell.appendChild(checkbox);
+      tr.appendChild(checkCell);
       tr.appendChild(el("td", "", score.label));
       tr.appendChild(el("td", "", String(score.score)));
       tr.appendChild(el("td", "", `${score.valueCount}/${score.contextCount}`));
       tr.appendChild(el("td", "", score.requiresFormat ? `${score.formatOkCount}/${score.valueCount || 0}` : "-"));
+      tr.appendChild(el("td", "", score.issueReasons && score.issueReasons.length ? score.issueReasons.slice(0, 2).join(" / ") : "-"));
       tr.appendChild(el("td", "", score.samples.join(" / ")));
       tbody.appendChild(tr);
     });
@@ -3804,24 +5451,123 @@
     return wrapper;
   }
 
-  function buildAiSelectorRetryPrompt(report, previousJsonText) {
-    const problems = [
-      ...report.errors.map((text) => `エラー: ${text}`),
-      ...report.warnings.map((text) => `警告: ${text}`),
-      ...report.fieldScores
-        .filter((score) => score.configured && (score.valueCount === 0 || score.score < 55))
-        .map((score) => `${score.label}: score ${score.score}, 取得 ${score.valueCount}/${score.contextCount}, 例 ${score.samples.join(" / ") || "なし"}`),
-    ];
+  function buildAiSelectorRetryPrompt(report, previousJsonText, options) {
+    const previousJson = safeParseJsonObject(previousJsonText);
+    const targetFields = getAiRetryTargetFields(report);
+    const targetKeys = new Set(targetFields.map((score) => score.key));
+    const fieldProblems = targetFields.map((score) => ({
+      key: score.key,
+      label: score.label,
+      currentRule: score.currentRule,
+      previousJsonFragment: findPreviousAiFieldFragment(previousJson, score.key, score.label),
+      score: score.score,
+      retrieved: `${score.valueCount}/${score.contextCount}`,
+      formatOk: score.requiresFormat ? `${score.formatOkCount}/${score.valueCount || 0}` : "-",
+      samples: score.samples,
+      emptyReasons: score.emptyReasons,
+      problems: score.issueReasons,
+      expectedFormat: getAiFieldExpectedFormat(score.key),
+      instruction: score.instruction,
+    }));
+    const globalProblems = filterAiGlobalProblemsForRetry(report, targetKeys);
+    const userReviewNote = normalizeText(options && options.userReviewNote || "");
+    const selectedFieldKeys = Array.isArray(report && report.retryFieldKeys) ? report.retryFieldKeys.slice() : targetFields.map((score) => score.key);
+    const excludedFieldKeys = Array.isArray(report && report.fieldScores)
+      ? report.fieldScores.filter((score) => !selectedFieldKeys.includes(score.key)).map((score) => score.key)
+      : [];
     return [
-      "前回の抽出設定JSONには以下の問題があります。サイト専用の固定ロジックではなく、同じ一覧内で繰り返し使えるCSSセレクタとして修正してください。",
+      `前回の抽出設定JSONを修正してください。これは${options && options.round ? `${options.round}回目` : "次"}の修正依頼です。`,
+      "全体を作り直すのではなく、下のfieldProblemsに出ている項目を優先して直してください。",
+      "extractionStrategyは css / tableExtraction / roomCells の主方式を維持し、必要がない限り別方式へ変えないでください。",
+      "humanReviewNoteがある場合は、自動判定より人間の目視判断を優先してください。",
+      "問題のない項目はなるべく変更しないでください。",
+      "サイト専用の固定ロジックではなく、同じ一覧内で繰り返し使えるCSSセレクタにしてください。",
+      "selectorに自信がない場合はselectorCandidatesに複数候補を入れてください。",
       "回答はJSONだけにしてください。説明文やMarkdownコードフェンスは不要です。",
       "",
-      "問題:",
-      problems.length ? problems.join("\n") : "明確なエラーはありませんが、より安定したセレクタに改善してください。",
+      "修正対象:",
+      JSON.stringify({
+        humanReviewNote: userReviewNote || "未記入",
+        selectedFieldKeys,
+        excludedFieldKeys,
+        globalProblems,
+        fieldProblems: fieldProblems.length ? fieldProblems : [{
+          note: "明確な項目別エラーはありません。nth-childが多い、広すぎる、長すぎるセレクタがあれば安定した候補へ改善してください。",
+        }],
+        rowSummary: {
+          rowCount: report.rowCount,
+          itemCount: report.itemCount,
+          roomCount: report.roomCount,
+          rowIssues: (report.rows || []).filter((row) => row && row._fieldIssues && Object.keys(row._fieldIssues).length).slice(0, 10).map((row) => ({
+            rowIndex: row.index,
+            issues: row._fieldIssues,
+            sample: {
+              room: row.room || "",
+              rent: row.rent || "",
+              managementFee: row.managementFee || "",
+              layout: row.layout || "",
+              area: row.area || "",
+            },
+          })),
+        },
+        requiredOutputShape: {
+          tableExtraction: "HTMLテーブルで抽出している場合は維持または修正。表でない場合は使わない",
+          itemSelector: "必要なら修正。問題なければ前回値を維持",
+          rowSelector: "必要なら修正。問題なければ前回値を維持",
+          fields: "修正対象項目だけでなく、最終的に使う全fieldsを含める",
+        },
+      }, null, 2),
       "",
       "前回JSON:",
       safeExtractJsonObjectText(previousJsonText),
     ].join("\n");
+  }
+
+  function getAiRetryTargetFields(report) {
+    const scores = Array.isArray(report && report.fieldScores) ? report.fieldScores : [];
+    if (Array.isArray(report && report.retryFieldKeys)) {
+      const selected = new Set(report.retryFieldKeys);
+      return scores.filter((score) => selected.has(score.key));
+    }
+    const targets = scores.filter((score) => {
+      if (!score.configured) return true;
+      if (score.issueReasons && score.issueReasons.length) return true;
+      if (score.valueCount === 0) return true;
+      if (score.score < 75) return true;
+      return false;
+    });
+    return targets.length ? targets : scores.filter((score) => score.score < 95).slice(0, 3);
+  }
+
+  function filterAiGlobalProblemsForRetry(report, targetKeys) {
+    const scores = Array.isArray(report && report.fieldScores) ? report.fieldScores : [];
+    const fieldLabels = scores.map((score) => [score.key, score.label]);
+    const isFieldSpecific = (message) => {
+      const matched = fieldLabels.find(([, label]) => message.startsWith(`${label} `) || message.startsWith(`${label}は`) || message.startsWith(`${label} は`));
+      if (!matched) return true;
+      return targetKeys.has(matched[0]);
+    };
+    return [
+      ...report.errors.map((text) => ({ level: "error", message: text })),
+      ...report.warnings.map((text) => ({ level: "warning", message: text })),
+    ].filter((entry) => isFieldSpecific(entry.message));
+  }
+
+  function safeParseJsonObject(value) {
+    try {
+      return parseAiSelectorResponse(value);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function findPreviousAiFieldFragment(previousJson, key, label) {
+    const fields = previousJson && previousJson.fields ? previousJson.fields : previousJson && previousJson.selectors ? previousJson.selectors : null;
+    if (!fields || typeof fields !== "object") return null;
+    if (fields[key]) return fields[key];
+    if (fields[label]) return fields[label];
+    const entry = Object.entries(fields).find(([rawKey]) => normalizeAiFieldKey(rawKey) === key);
+    return entry ? entry[1] : null;
   }
 
   function safeExtractJsonObjectText(value) {
@@ -5217,6 +6963,12 @@
     if (!(activeProfile && activeProfile.listingExtractor)) return [];
     const config = getListingExtractorConfig();
     if (config.enabled === false) return [];
+    return extractRowsForListingConfig(config);
+  }
+
+  function extractRowsForListingConfig(config) {
+    const tableRows = extractTableBasedListingRows(config);
+    if (tableRows.length) return tableRows;
     const ruleRows = extractRuleBasedListingRows(config);
     if (ruleRows.length) return ruleRows;
     return [];
@@ -5226,6 +6978,221 @@
     return rows.map((row, index) => ({ ...row, index: index + 1 }));
   }
 
+  function extractTableBasedListingRows(config) {
+    const tableConfig = config && config.tableExtraction ? sanitizeTableExtractionConfig(config.tableExtraction) : null;
+    if (!tableConfig || tableConfig.enabled !== true) return [];
+    const rows = tableConfig.mode === "roomCells"
+      ? extractRoomCellTableRows(config, tableConfig)
+      : extractStandardTableRows(config, tableConfig);
+    return rows.filter(hasMeaningfulTableRow);
+  }
+
+  function extractStandardTableRows(config, tableConfig) {
+    const tables = getTableExtractionRoots(tableConfig);
+    if (!tables.length || !Object.keys(tableConfig.columns || {}).length) return [];
+    return tables.flatMap((table, tableIndex) => {
+      const rowNodes = getStandardTableRowNodes(table, tableConfig);
+      return rowNodes
+        .slice(tableConfig.dataStartRowIndex)
+        .map((row, rowIndex) => buildTableListingRow(config, tableConfig, table, row, rowIndex, tableIndex, getTableRowCells(row, tableConfig.cellSelector)));
+    });
+  }
+
+  function extractRoomCellTableRows(config, tableConfig) {
+    const roots = getTableExtractionRoots(tableConfig);
+    if (!roots.length) return [];
+    return roots.flatMap((root, tableIndex) => {
+      const roomNodes = getRoomCellTableRowNodes(root, tableConfig);
+      return roomNodes.map((node, rowIndex) => buildTableListingRow(config, tableConfig, root, node, rowIndex, tableIndex, getTableRowCells(node, tableConfig.cellSelector)));
+    });
+  }
+
+  function getTableExtractionRoots(tableConfig) {
+    if (!tableConfig || !tableConfig.tableSelector || !isSelectorValidForPreview(tableConfig.tableSelector)) return [];
+    return safeQuerySelectorAll(document, tableConfig.tableSelector)
+      .filter((node) => node && !(node.closest && node.closest(`#${APP_ID}, #${APP_ID}-modal`)))
+      .slice(0, 20);
+  }
+
+  function getStandardTableRowNodes(table, tableConfig) {
+    const rows = tableConfig.rowSelector && isSelectorValidForPreview(tableConfig.rowSelector)
+      ? safeQuerySelectorAll(table, tableConfig.rowSelector)
+      : Array.from(table.rows || []);
+    return rows.filter((row) => row && row.nodeType === Node.ELEMENT_NODE);
+  }
+
+  function getRoomCellTableRowNodes(root, tableConfig) {
+    const selector = tableConfig.roomSelector || (tableConfig.rowSelector && tableConfig.rowSelector !== "tr" ? tableConfig.rowSelector : "td.room, [class~='room']");
+    if (!selector || !isSelectorValidForPreview(selector)) return [];
+    return safeQuerySelectorAll(root, selector).filter((node) => node && node.nodeType === Node.ELEMENT_NODE);
+  }
+
+  function getTableRowCells(row, cellSelector) {
+    if (!row) return [];
+    const directCells = Array.from(row.children || []).filter((child) => child && (child.tagName === "TD" || child.tagName === "TH"));
+    if (directCells.length) return directCells;
+    const selector = cellSelector && isSelectorValidForPreview(cellSelector) ? cellSelector : "td,th";
+    return safeQuerySelectorAll(row, selector).filter((cell) => cell.closest && cell.closest("tr") === row);
+  }
+
+  function buildTableListingRow(config, tableConfig, table, rowNode, rowIndex, tableIndex, cells) {
+    const values = {};
+    const rawValues = {};
+    const columns = tableConfig.columns || {};
+    getListingFieldIds().forEach(({ key }) => {
+      const spec = columns[key];
+      if (!spec) return;
+      const extracted = readTableColumnValueWithRaw(config, tableConfig, table, rowNode, cells, spec, key, rawValues);
+      rawValues[key] = extracted.raw || extracted.cut;
+      if (extracted.cut && extracted.cut !== extracted.raw) rawValues[`${key}Cut`] = extracted.cut;
+      values[key] = normalizeTableColumnValue(key, extracted.cut || extracted.raw, values.rent, spec);
+    });
+    if (columns.depositKeyMoney && (!values.deposit || !values.keyMoney)) {
+      const extracted = readTableColumnValueWithRaw(config, tableConfig, table, rowNode, cells, columns.depositKeyMoney, "depositKeyMoney", rawValues);
+      rawValues.depositKeyMoney = extracted.raw || extracted.cut;
+      if (extracted.cut && extracted.cut !== extracted.raw) rawValues.depositKeyMoneyCut = extracted.cut;
+      const split = splitTableDepositKeyMoney(extracted.cut || extracted.raw);
+      if (!values.deposit && split.deposit) values.deposit = normalizeLeaseCostByRent(split.deposit, values.rent, columns.depositKeyMoney.normalizer || "rentMonth");
+      if (!values.keyMoney && split.keyMoney) values.keyMoney = normalizeLeaseCostByRent(split.keyMoney, values.rent, columns.depositKeyMoney.normalizer || "rentMonth");
+    }
+    if (!values.buildingName) {
+      const buildingName = readTableBuildingName(config, tableConfig, table);
+      if (buildingName) {
+        rawValues.buildingName = rawValues.buildingName || buildingName;
+        values.buildingName = cleanConfiguredBuildingName(buildingName);
+      }
+    }
+    applyTableFallbackValues(rowNode, values, rawValues);
+    const buildingName = cleanConfiguredBuildingName(values.buildingName || "");
+    const rowUrl = getFirstUrl(rowNode);
+    const tableUrl = getFirstUrl(table);
+    const rowIdentityText = normalizeText(rowNode && (rowNode.innerText || rowNode.textContent) || "");
+    return {
+      ...values,
+      _emptyReasons: {},
+      _explicitRoomScope: true,
+      _itemScopeIsDocument: false,
+      _itemScopeKey: getNodeUid(table),
+      _roomScopeKey: getNodeUid(rowNode),
+      _rowIdentityText: rowIdentityText,
+      _rawValues: rawValues,
+      index: rowIndex + 1,
+      propertyName: buildingName,
+      buildingName,
+      room: values.room || "",
+      rent: values.rent || "",
+      managementFee: values.managementFee || "",
+      deposit: values.deposit || "",
+      keyMoney: values.keyMoney || "",
+      availableDate: values.availableDate || "",
+      ad: values.ad || "未記載",
+      layout: values.layout || "",
+      area: values.area || "",
+      source: tableConfig.mode === "roomCells" ? "configured room-cell table" : "configured table",
+      _rowUrl: rowUrl,
+      url: rowUrl || tableUrl,
+      _tableIndex: tableIndex + 1,
+    };
+  }
+
+  function readTableColumnValue(config, tableConfig, table, rowNode, cells, spec, key, rawValues) {
+    const extracted = readTableColumnValueWithRaw(config, tableConfig, table, rowNode, cells, spec, key, rawValues);
+    return extracted.cut || extracted.raw || "";
+  }
+
+  function readTableColumnValueWithRaw(config, tableConfig, table, rowNode, cells, spec, key, rawValues) {
+    if (!spec) return { raw: "", cut: "" };
+    if (spec.source && rawValues && rawValues[spec.source]) {
+      const cut = extractTablePartValue(rawValues[spec.source], spec);
+      return { raw: rawValues[spec.source], cut };
+    }
+    let node = null;
+    if (spec.selector) {
+      const scope = key === "buildingName" ? table : rowNode;
+      node = safeQuerySelectorIncludingSelf(scope, spec.selector) || (key === "buildingName" ? safeQuerySelector(document, spec.selector) : null);
+    }
+    if (!node && Number.isInteger(spec.index) && spec.index >= 0) node = cells[spec.index] || null;
+    if (!node) return { raw: "", cut: "" };
+    const raw = readConfiguredAttribute(node, spec.attribute || "text", config, { ...spec, lineMode: "" });
+    const lineValue = applyConfiguredLineMode(raw, spec.lineMode);
+    return {
+      raw: normalizeText(raw),
+      cut: spec.regex ? applyRuleRegex(lineValue, spec) : normalizeText(lineValue),
+    };
+  }
+
+  function readTableBuildingName(config, tableConfig, table) {
+    if (!tableConfig.buildingNameSelector || !isSelectorValidForPreview(tableConfig.buildingNameSelector)) return "";
+    const node = safeQuerySelectorIncludingSelf(table, tableConfig.buildingNameSelector) || safeQuerySelector(document, tableConfig.buildingNameSelector);
+    if (!node) return "";
+    return normalizeText(readConfiguredAttribute(node, "text", config, { lineMode: "" }));
+  }
+
+  function normalizeTableColumnValue(key, raw, rentValue, spec) {
+    if (!raw) return "";
+    const normalizer = spec && spec.normalizer || getDefaultListingNormalizer(key);
+    if (key === "deposit" || key === "keyMoney") return normalizeLeaseCostByRent(raw, rentValue, normalizer);
+    return normalizeConfiguredValue(raw, normalizer, key);
+  }
+
+  function extractTablePartValue(sourceValue, spec) {
+    if (!sourceValue) return "";
+    const parts = splitTablePairParts(sourceValue, spec && spec.delimiter);
+    const part = String(spec && spec.part || "").toLowerCase();
+    if (part === "keymoney" || part === "key" || part === "礼金") return parts[1] || "";
+    if (part === "deposit" || part === "敷金") return parts[0] || "";
+    const index = Number(spec && spec.index);
+    if (Number.isFinite(index) && parts[index]) return parts[index];
+    return parts[0] || "";
+  }
+
+  function splitTableDepositKeyMoney(sourceValue) {
+    const parts = splitTablePairParts(sourceValue);
+    return {
+      deposit: parts[0] || "",
+      keyMoney: parts[1] || "",
+    };
+  }
+
+  function splitTablePairParts(sourceValue, delimiter) {
+    const text = normalizeText(sourceValue);
+    if (!text) return [];
+    let pattern = /[/／・|]/;
+    if (delimiter) {
+      try {
+        pattern = new RegExp(delimiter);
+      } catch (error) {
+        pattern = /[/／・|]/;
+      }
+    }
+    const parts = text.split(pattern).map((part) => normalizeText(part)).filter(Boolean);
+    if (parts.length >= 2) return parts;
+    const labeled = text.match(/(?:敷金?|保証金)\s*[:：]?\s*([^/\s　]+).*?(?:礼金?)\s*[:：]?\s*([^/\s　]+)/);
+    return labeled ? [labeled[1], labeled[2]] : parts;
+  }
+
+  function applyTableFallbackValues(rowNode, values, rawValues) {
+    const text = normalizeNumberText(rowNode && (rowNode.innerText || rowNode.textContent) || "");
+    if (!text) return;
+    if (!values.rent) values.rent = normalizeConfiguredValue(extractRentFromText(text), "rent", "rent");
+    if (!values.managementFee) values.managementFee = normalizeConfiguredValue(extractManagementFeeFromText(text, values.rent), "yen", "managementFee");
+    if (!values.layout) values.layout = normalizeConfiguredValue(extractLayoutFromText(text), "layout", "layout");
+    if (!values.area) values.area = normalizeConfiguredValue(extractAreaFromText(text), "area", "area");
+    if (!values.room) {
+      const labeled = text.match(/(?:部屋番号|号室)\s*[:：]?\s*([0-9A-Za-z-]+)/);
+      values.room = labeled ? normalizeText(labeled[1]) : "";
+    }
+    if (!rawValues.rowText) rawValues.rowText = truncateText(text, 500);
+  }
+
+  function hasMeaningfulTableRow(row) {
+    if (!row) return false;
+    return ["buildingName", "room", "rent", "managementFee", "deposit", "keyMoney", "availableDate", "layout", "area"].some((key) => {
+      const value = normalizeText(row[key] || "");
+      return value && value !== "相談" && value !== "未記載";
+    });
+  }
+
   function extractRuleBasedListingRows(config) {
     if (!config.fields || !Object.keys(config.fields).length) return [];
     const items = getConfiguredItemScopes(config);
@@ -5233,6 +7200,7 @@
       const rowScopes = getConfiguredRowScopes(item, config);
       return rowScopes.map((row, rowIndex) => {
         const values = {};
+        const rawValues = {};
         const context = {
           item: item === document.body && row && row !== document.body ? row : item,
           row,
@@ -5244,7 +7212,12 @@
 
         Object.entries(config.fields || {}).forEach(([fieldId, field]) => {
           if (!field || field.enabled === false) return;
-          values[fieldId] = extractConfiguredField(fieldId, field, context, values);
+          const extracted = extractConfiguredFieldWithRaw(fieldId, field, context, values);
+          values[fieldId] = extracted.value;
+          if (extracted.raw) rawValues[fieldId] = extracted.raw;
+          if (extracted.cut && extracted.cut !== extracted.raw) {
+            rawValues[`${fieldId}Cut`] = extracted.cut;
+          }
         });
 
         applyConfiguredSplitRules(config, context, values);
@@ -5264,6 +7237,7 @@
           _itemScopeKey: getNodeUid(item),
           _roomScopeKey: getNodeUid(row),
           _rowIdentityText: rowIdentityText,
+          _rawValues: rawValues,
           index: rowIndex + 1,
           propertyName: buildingName,
           buildingName,
@@ -5477,22 +7451,37 @@
   }
 
   function extractConfiguredField(fieldId, field, context, values) {
+    return extractConfiguredFieldWithRaw(fieldId, field, context, values).value;
+  }
+
+  function extractConfiguredFieldWithRaw(fieldId, field, context, values) {
     for (const rule of field.rules || []) {
-      const raw = extractConfiguredRule(fieldId, rule, context, values);
+      const extracted = extractConfiguredRuleWithRaw(fieldId, rule, context, values);
+      const raw = extracted.cut || extracted.raw || "";
       const normalized = normalizeConfiguredValue(raw, rule.normalizer || field.normalizer || "text", fieldId);
       if (normalized) {
         if (rule.field && rule.field !== fieldId) {
           if (!values[rule.field]) values[rule.field] = normalized;
           continue;
         }
-        return normalized;
+        return {
+          value: normalized,
+          raw: extracted.raw || raw,
+          cut: extracted.cut || raw,
+        };
       }
     }
     if (hasConfiguredFieldInput(field)) {
       const fallback = extractConfiguredFieldFallback(fieldId, context, values);
-      if (fallback) return normalizeConfiguredValue(fallback, getConfiguredFieldNormalizer(context.config, fieldId), fieldId);
+      if (fallback) {
+        return {
+          value: normalizeConfiguredValue(fallback, getConfiguredFieldNormalizer(context.config, fieldId), fieldId),
+          raw: fallback,
+          cut: fallback,
+        };
+      }
     }
-    return "";
+    return { value: "", raw: "", cut: "" };
   }
 
   function extractConfiguredFieldFallback(fieldId, context, values) {
@@ -5569,23 +7558,45 @@
   }
 
   function extractConfiguredRule(fieldId, rule, context, values) {
-    if (!rule || rule.enabled === false) return "";
-    if ((rule.type === "selector" || rule.type === "regex") && !rule.selector && !rule.regex && !rule.pattern) return "";
-    if (rule.type === "selector") return extractConfiguredSelectorRule(fieldId, rule, context);
-    if (rule.type === "label") return extractConfiguredLabelRule(rule, context);
-    if (rule.type === "regex") return extractConfiguredRegexRule(fieldId, rule, context);
-    if (rule.type === "split") return extractConfiguredSplitRule(rule, values);
-    return "";
+    const extracted = extractConfiguredRuleWithRaw(fieldId, rule, context, values);
+    return extracted.cut || extracted.raw || "";
+  }
+
+  function extractConfiguredRuleWithRaw(fieldId, rule, context, values) {
+    if (!rule || rule.enabled === false) return { raw: "", cut: "" };
+    if ((rule.type === "selector" || rule.type === "regex") && !rule.selector && !rule.regex && !rule.pattern) return { raw: "", cut: "" };
+    if (rule.type === "selector") return extractConfiguredSelectorRuleWithRaw(fieldId, rule, context);
+    if (rule.type === "label") {
+      const raw = extractConfiguredLabelRule(rule, context);
+      return { raw, cut: raw };
+    }
+    if (rule.type === "regex") {
+      const raw = getConfiguredScopeText(toListingTextScope(getConfiguredRuleScope(fieldId, rule, context.config)), context);
+      return { raw, cut: applyRuleRegex(raw, rule) };
+    }
+    if (rule.type === "split") {
+      const cut = extractConfiguredSplitRule(rule, values);
+      return { raw: values[rule.sourceField] || cut, cut };
+    }
+    return { raw: "", cut: "" };
   }
 
   function extractConfiguredSelectorRule(fieldId, rule, context) {
+    const extracted = extractConfiguredSelectorRuleWithRaw(fieldId, rule, context);
+    return extracted.cut || extracted.raw || "";
+  }
+
+  function extractConfiguredSelectorRuleWithRaw(fieldId, rule, context) {
     const ruleScope = getConfiguredRuleScope(fieldId, rule, context.config);
     const scope = getConfiguredScope(ruleScope, context);
     let node = rule.selector ? safeQuerySelectorIncludingSelf(scope, rule.selector) : scope;
     if (!node && ruleScope === "row") node = findIndexedRoomFieldNode(fieldId, rule, context);
-    if (!node) return "";
+    if (!node) return { raw: "", cut: "" };
     const rawValue = readConfiguredAttribute(node, rule.attribute || "text", context.config, rule);
-    return applyRuleRegex(rawValue, rule);
+    return {
+      raw: normalizeText(rawValue),
+      cut: applyRuleRegex(rawValue, rule),
+    };
   }
 
   function findIndexedRoomFieldNode(fieldId, rule, context) {
@@ -5788,7 +7799,7 @@
   }
 
   function parseJapaneseYenAmount(value, options) {
-    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    const text = normalizeNumberText(value).replace(/[￥¥\\]/g, "").replace(/\s+/g, "");
     if (!text) return null;
     if (options && options.allowManYen) {
       const manMatch = text.match(/([0-9]+(?:\.[0-9]+)?)万(?:円)?/);
@@ -5966,6 +7977,13 @@
   }
 
   function getListingNoRowsMessage(config) {
+    const tableConfig = config && config.tableExtraction ? sanitizeTableExtractionConfig(config.tableExtraction) : null;
+    if (tableConfig && tableConfig.enabled === true) {
+      if (!tableConfig.tableSelector) return "テーブル抽出が有効ですが、対象テーブルCSSが未設定です";
+      if (!getTableExtractionRoots(tableConfig).length) return "テーブル抽出の対象テーブルが0件です。tableSelectorを見直してください";
+      if (!Object.keys(tableConfig.columns || {}).length) return "テーブル抽出の列設定がありません";
+      if (!extractTableBasedListingRows(config).length) return "テーブルは見つかりましたが、部屋行を作れませんでした。行開始位置か列設定を見直してください";
+    }
     if (config && config.itemSelector && !safeQuerySelectorAll(document, config.itemSelector).length) {
       return "1物件のまとまりが0件です。項目が取れていても、まとまり指定が外れています";
     }
@@ -6015,6 +8033,14 @@
         ...defaults.cellText,
         ...(configured.cellText || {}),
       },
+      tableExtraction: {
+        ...defaults.tableExtraction,
+        ...((configured && configured.tableExtraction) || {}),
+        columns: {
+          ...((defaults.tableExtraction && defaults.tableExtraction.columns) || {}),
+          ...((configured && configured.tableExtraction && configured.tableExtraction.columns) || {}),
+        },
+      },
     });
     ensureListingOutputColumns(merged);
     return merged;
@@ -6029,7 +8055,94 @@
         rules: ((field && field.rules) || []).filter((rule) => rule && (rule.type === "selector" || rule.type === "regex")),
       };
     });
+    next.tableExtraction = sanitizeTableExtractionConfig(next.tableExtraction);
     return next;
+  }
+
+  function sanitizeTableExtractionConfig(rawConfig) {
+    const defaults = createDefaultTableExtraction();
+    const source = rawConfig && typeof rawConfig === "object" ? rawConfig : {};
+    const next = {
+      ...defaults,
+      ...source,
+      enabled: source.enabled === true,
+      mode: normalizeTableExtractionMode(source.mode || defaults.mode),
+      tableSelector: typeof source.tableSelector === "string" ? source.tableSelector.trim() : "",
+      rowSelector: typeof source.rowSelector === "string" ? source.rowSelector.trim() : defaults.rowSelector,
+      cellSelector: typeof source.cellSelector === "string" ? source.cellSelector.trim() : defaults.cellSelector,
+      headerRowIndex: normalizeTableRowIndex(source.headerRowIndex, defaults.headerRowIndex),
+      dataStartRowIndex: normalizeTableRowIndex(source.dataStartRowIndex, defaults.dataStartRowIndex),
+      roomSelector: typeof source.roomSelector === "string" ? source.roomSelector.trim() : "",
+      buildingNameSelector: typeof source.buildingNameSelector === "string" ? source.buildingNameSelector.trim() : "",
+      columns: {},
+      excludeColumns: Array.isArray(source.excludeColumns)
+        ? source.excludeColumns.map((value) => normalizeText(value)).filter(Boolean).slice(0, 20)
+        : [],
+    };
+    Object.entries((source && source.columns) || {}).forEach(([rawKey, rawValue]) => {
+      const key = normalizeTableColumnKey(rawKey);
+      const spec = normalizeTableColumnSpec(rawValue, key);
+      if (key && spec) next.columns[key] = spec;
+    });
+    return next;
+  }
+
+  function normalizeTableExtractionMode(value) {
+    const mode = String(value || "").trim();
+    return mode === "roomCells" ? "roomCells" : "standard";
+  }
+
+  function normalizeTableRowIndex(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 ? Math.floor(number) : fallback;
+  }
+
+  function normalizeTableColumnKey(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    if (raw === "depositKeyMoney" || raw === "deposit_key_money" || raw === "敷金/礼金" || raw === "敷礼") return "depositKeyMoney";
+    return normalizeAiFieldKey(raw);
+  }
+
+  function normalizeTableColumnSpec(rawValue, key) {
+    if (rawValue == null || rawValue === false) return null;
+    if (Number.isInteger(rawValue) || String(rawValue).match(/^\d+$/)) {
+      return {
+        index: Number(rawValue),
+        selector: "",
+        attribute: "text",
+        normalizer: getTableColumnDefaultNormalizer(key),
+      };
+    }
+    if (typeof rawValue === "string") {
+      return {
+        index: null,
+        selector: rawValue.trim(),
+        attribute: "text",
+        normalizer: getTableColumnDefaultNormalizer(key),
+      };
+    }
+    if (typeof rawValue !== "object") return null;
+    const indexValue = rawValue.index != null ? rawValue.index : rawValue.columnIndex;
+    const index = Number(indexValue);
+    return {
+      index: Number.isFinite(index) && index >= 0 ? Math.floor(index) : null,
+      selector: typeof rawValue.selector === "string" ? rawValue.selector.trim() : typeof rawValue.css === "string" ? rawValue.css.trim() : "",
+      attribute: typeof rawValue.attribute === "string" ? rawValue.attribute.trim() || "text" : "text",
+      normalizer: normalizeAiNormalizer(key === "depositKeyMoney" ? "deposit" : key, rawValue.normalizer || rawValue.format || rawValue.formatter || getTableColumnDefaultNormalizer(key)),
+      regex: typeof rawValue.regex === "string" ? rawValue.regex.trim() : typeof rawValue.pattern === "string" ? rawValue.pattern.trim() : "",
+      group: Number.isInteger(rawValue.group) ? rawValue.group : Number.isInteger(rawValue.captureGroup) ? rawValue.captureGroup : 1,
+      flags: typeof rawValue.flags === "string" ? rawValue.flags : "",
+      lineMode: normalizeAiLineMode(rawValue.lineMode || rawValue.line_mode || ""),
+      source: typeof rawValue.source === "string" ? normalizeTableColumnKey(rawValue.source) : "",
+      part: typeof rawValue.part === "string" ? rawValue.part.trim() : "",
+      delimiter: typeof rawValue.delimiter === "string" ? rawValue.delimiter : typeof rawValue.separator === "string" ? rawValue.separator : "",
+    };
+  }
+
+  function getTableColumnDefaultNormalizer(key) {
+    if (key === "depositKeyMoney") return "rentMonth";
+    return getDefaultListingNormalizer(key);
   }
 
   function clearListingFieldRules(config) {
@@ -6153,12 +8266,17 @@
     const wrapper = el("div", "rech-table-wrap");
     const table = el("table", "rech-result-table");
     const columns = [["index", "#"], ...getListingOutputColumns().filter(([key]) => key !== "url")];
+    const rowCopyTemplates = options && Array.isArray(options.rowCopyTemplates) ? options.rowCopyTemplates : [];
+    const displayColumns = rowCopyTemplates.length ? [["__copy", "コピー"], ...columns] : columns;
     const sortState = options && options.sortState ? options.sortState : { key: "", direction: "asc" };
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
-    columns.forEach(([key, label]) => {
+    displayColumns.forEach(([key, label]) => {
       const th = el("th", "", "");
-      if (options && options.sortable && typeof options.onSort === "function") {
+      if (key === "__copy") {
+        th.textContent = label;
+        th.classList.add("is-copy-column");
+      } else if (options && options.sortable && typeof options.onSort === "function") {
         const sortButton = button(getSortableHeaderLabel(key, label, sortState), "rech-sort-button", () => options.onSort(key));
         sortButton.type = "button";
         sortButton.title = `${label}で並び替え`;
@@ -6177,11 +8295,25 @@
     const tbody = document.createElement("tbody");
     rows.forEach((row, rowIndex) => {
       const tr = document.createElement("tr");
-      columns.forEach(([key]) => {
+      tr.classList.add(rowIndex % 2 === 1 ? "is-even-row" : "is-odd-row");
+      displayColumns.forEach(([key]) => {
         const td = document.createElement("td");
-        const value = key === "index" ? String(rowIndex + 1) : row[key] || "";
+        const value = getListingTableCellDisplayValue(row, key, rowIndex, options);
         const fieldKey = getListingFieldKeyForColumn(key);
-        if (key === "propertyName" && row.url) {
+        const fieldIssue = fieldKey && row._fieldIssues && row._fieldIssues[fieldKey] ? row._fieldIssues[fieldKey] : "";
+        if (key === "__copy") {
+          td.className = "rech-row-copy-cell";
+          rowCopyTemplates.forEach((templateEntry, templateIndex) => {
+            const copyButton = button(templateEntry.name || `文面${templateIndex + 1}`, "rech-secondary rech-mini-button rech-row-copy-button", () => {
+              if (options && typeof options.onCopyRowTemplate === "function") {
+                options.onCopyRowTemplate(row, templateEntry);
+              }
+            });
+            copyButton.type = "button";
+            copyButton.title = `この部屋を${templateEntry.name || `文面${templateIndex + 1}`}でコピー`;
+            td.appendChild(copyButton);
+          });
+        } else if (key === "propertyName" && row.url) {
           const link = document.createElement("a");
           link.href = row.url;
           link.target = "_blank";
@@ -6222,6 +8354,10 @@
             td.textContent = value;
           }
         }
+        if (fieldIssue) {
+          td.classList.add("is-suspicious");
+          td.title = td.title ? `${td.title} / ${fieldIssue}` : fieldIssue;
+        }
         if (options && options.directFieldPick && fieldKey && key !== "propertyName" && typeof options.onPickField === "function") {
           td.title = td.title || "ダブルクリックでこの項目の取得場所を設定";
           td.addEventListener("dblclick", () => options.onPickField(fieldKey));
@@ -6231,12 +8367,30 @@
       });
       tbody.appendChild(tr);
       if (row._duplicates && row._duplicates.length) {
-        tbody.appendChild(renderDuplicateRows(row._duplicates, columns));
+        tbody.appendChild(renderDuplicateRows(row._duplicates, displayColumns));
       }
     });
     table.appendChild(tbody);
     wrapper.appendChild(table);
     return wrapper;
+  }
+
+  function getListingTableCellDisplayValue(row, key, rowIndex, options) {
+    if (key === "index") return String(rowIndex + 1);
+    if (key === "__copy") return "";
+    if (options && options.valueMode === "raw") {
+      const raw = getListingRawDisplayValue(row, key);
+      if (raw) return raw;
+    }
+    return key === "propertyName" ? row.propertyName || row.buildingName || "" : row[key] || "";
+  }
+
+  function getListingRawDisplayValue(row, key) {
+    if (!row || !row._rawValues) return "";
+    if (key === "propertyName") return normalizeText(row._rawValues.buildingName || row._rawValues.propertyName || "");
+    const fieldKey = getListingFieldKeyForColumn(key);
+    if (!fieldKey) return "";
+    return normalizeText(row._rawValues[fieldKey] || row._rawValues[`${fieldKey}Cut`] || "");
   }
 
   function getListingFieldKeyForColumn(key) {
@@ -6256,7 +8410,7 @@
     const tbody = document.createElement("tbody");
     duplicates.slice(0, 10).forEach((row) => {
       const duplicateTr = document.createElement("tr");
-      columns.filter(([key]) => key !== "index").forEach(([key]) => {
+      columns.filter(([key]) => key !== "index" && key !== "__copy").forEach(([key]) => {
         const cell = document.createElement("td");
         cell.textContent = key === "propertyName" ? row.propertyName || row.buildingName || "" : row[key] || "";
         duplicateTr.appendChild(cell);
@@ -6891,6 +9045,30 @@
     });
   }
 
+  function createOutputValuesForRow(row, options) {
+    const values = {
+      ...(row || {}),
+      propertyName: row && (row.propertyName || row.buildingName) || "",
+      buildingName: row && (row.buildingName || row.propertyName) || "",
+      moveInDate: row && (row.moveInDate || row.availableDate) || "",
+      availableDate: row && (row.availableDate || row.moveInDate) || "",
+    };
+    if (options && options.htmlCell) {
+      values.rent = formatYenForHtmlCell(values.rent);
+      values.managementFee = formatYenForHtmlCell(values.managementFee);
+    }
+    return values;
+  }
+
+  function formatYenForHtmlCell(value) {
+    const text = normalizeText(value || "");
+    if (!text) return "";
+    if (/申込|申し込み|申込み|非募集|募集停止|満室/.test(text)) return text;
+    const amount = parseJapaneseYenAmount(text, { allowManYen: true, assumeYenForPlainNumber: true, assumeManYenForPlainDecimal: true, assumeManYenForSmallPlainNumber: true });
+    if (amount != null) return amount.toLocaleString("ja-JP");
+    return text.replace(/[￥¥\\]/g, "").replace(/円$/, "").trim();
+  }
+
   async function copyToClipboard(text) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       await navigator.clipboard.writeText(text);
@@ -7284,6 +9462,33 @@
   font-size: 12px;
   white-space: nowrap;
 }
+#${APP_ID} .rech-value-mode-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 12px 0;
+  padding: 6px 8px;
+  color: #475569;
+  background: #f8fafc;
+  border: 1px solid #e1e7ed;
+  border-radius: 6px;
+  font-size: 11px;
+}
+#${APP_ID} .rech-value-mode-toggle > span {
+  font-weight: 800;
+  color: #334155;
+}
+#${APP_ID} .rech-value-mode-toggle .is-active {
+  color: #ffffff;
+  background: #334155;
+  border-color: #334155;
+}
+#${APP_ID} .rech-value-mode-toggle small {
+  flex-basis: 100%;
+  color: #64748b;
+  line-height: 1.35;
+}
 #${APP_ID} .rech-anomaly-slot {
   flex: 0 0 auto;
 }
@@ -7301,6 +9506,17 @@
 }
 #${APP_ID} .rech-anomaly-warnings[hidden] {
   display: none;
+}
+#${APP_ID} .rech-anomaly-warning-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+#${APP_ID} .rech-anomaly-close {
+  min-height: 22px;
+  padding: 2px 6px;
+  font-size: 11px;
 }
 #${APP_ID} .rech-resize-edge,
 .rech-modal .rech-resize-edge {
@@ -7412,7 +9628,7 @@
   top: 0;
   z-index: 1;
   color: #334155;
-  background: #eef3f7;
+  background: #dbe4ee;
   font-weight: 700;
   white-space: nowrap;
 }
@@ -7443,6 +9659,17 @@
 .rech-modal .rech-result-table td {
   overflow-wrap: anywhere;
 }
+#${APP_ID} .rech-result-table tbody tr.is-even-row > td,
+.rech-modal .rech-result-table tbody tr.is-even-row > td {
+  background: #f6f7f9;
+}
+#${APP_ID} .rech-result-table td.is-suspicious,
+.rech-modal .rech-result-table td.is-suspicious,
+#${APP_ID} .rech-result-table tbody tr.is-even-row > td.is-suspicious,
+.rech-modal .rech-result-table tbody tr.is-even-row > td.is-suspicious {
+  background: #fff7d6;
+  box-shadow: inset 0 0 0 1px #facc15;
+}
 #${APP_ID} .rech-cell-badge,
 .rech-modal .rech-cell-badge {
   display: inline-flex;
@@ -7464,6 +9691,25 @@
   align-items: center;
   gap: 5px;
   white-space: nowrap;
+}
+#${APP_ID} .rech-row-copy-cell,
+.rech-modal .rech-row-copy-cell {
+  min-width: 104px;
+  max-width: 140px;
+  white-space: normal;
+}
+#${APP_ID} .rech-row-copy-button,
+.rech-modal .rech-row-copy-button {
+  display: inline-flex;
+  max-width: 100%;
+  min-height: 18px;
+  margin: 1px 2px 1px 0;
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 #${APP_ID} .rech-duplicate-toggle,
 .rech-modal .rech-duplicate-toggle {
@@ -7558,6 +9804,32 @@
   display: block;
   color: #6b7280;
 }
+.rech-modal .rech-ai-session {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  margin: 8px 0;
+  padding: 9px 10px;
+  color: #334155;
+  background: #ffffff;
+  border: 1px solid #d8e0e7;
+  border-radius: 6px;
+  font-size: 12px;
+}
+.rech-modal .rech-ai-session strong {
+  color: #17202a;
+  font-size: 12px;
+}
+.rech-modal .rech-ai-session span {
+  min-width: 0;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.rech-modal .rech-ai-session small {
+  grid-column: 1 / -1;
+  color: #64748b;
+  line-height: 1.35;
+}
 .rech-modal .rech-ai-flow {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
@@ -7630,6 +9902,9 @@
   gap: 8px;
   margin: 0;
 }
+.rech-modal .rech-ai-actions .is-soft-disabled {
+  opacity: 0.55;
+}
 .rech-modal .rech-ai-source-control {
   display: grid;
   gap: 6px;
@@ -7671,6 +9946,43 @@
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
+.rech-modal .rech-ai-source-diagnostics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 6px;
+  align-items: center;
+  min-width: 0;
+  padding: 6px 7px;
+  color: #475569;
+  background: #f8fafc;
+  border: 1px solid #edf1f5;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.rech-modal .rech-ai-source-metric {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 6px;
+  background: #ffffff;
+  border: 1px solid #dbe3ea;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.rech-modal .rech-ai-source-metric strong {
+  color: #334155;
+  font-weight: 800;
+}
+.rech-modal .rech-ai-source-diagnostics-note {
+  flex-basis: 100%;
+  color: #64748b;
+  overflow-wrap: anywhere;
+}
+.rech-modal .rech-ai-source-diagnostics-note.is-warning {
+  color: #9a3412;
+}
 .rech-modal .rech-ai-source-note {
   color: #475569;
   font-size: 12px;
@@ -7707,6 +10019,14 @@
   line-height: 1.4;
   background: #ffffff;
 }
+.rech-modal .rech-ai-note-textarea {
+  min-height: 72px;
+  max-height: 150px;
+}
+.rech-modal .rech-ai-retry-textarea {
+  min-height: 92px;
+  max-height: 220px;
+}
 .rech-modal .rech-ai-shape-list {
   display: grid;
   gap: 4px;
@@ -7726,6 +10046,8 @@
   display: grid;
   gap: 8px;
   margin-top: 0;
+  min-width: 0;
+  overflow: visible;
 }
 .rech-modal .rech-ai-review[hidden] {
   display: none;
@@ -7760,6 +10082,7 @@
 .rech-modal .rech-ai-review-list,
 .rech-modal .rech-ai-score,
 .rech-modal .rech-ai-table-preview {
+  min-width: 0;
   padding: 9px 10px;
   color: #334155;
   background: #ffffff;
@@ -7767,11 +10090,25 @@
   border-radius: 6px;
   font-size: 12px;
 }
+.rech-modal .rech-ai-score,
+.rech-modal .rech-ai-table-preview {
+  overflow: hidden;
+}
+.rech-modal .rech-ai-score {
+  overflow: auto;
+}
 .rech-modal .rech-ai-review-list strong,
 .rech-modal .rech-ai-score strong,
 .rech-modal .rech-ai-table-preview strong {
   display: block;
   margin-bottom: 5px;
+}
+.rech-modal .rech-ai-preview-note {
+  display: block;
+  margin: 0 0 6px;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.35;
 }
 .rech-modal .rech-ai-review-list ul {
   margin: 0;
@@ -7794,8 +10131,16 @@
   border-color: #bfdbfe;
 }
 .rech-modal .rech-ai-score-table {
+  min-width: 560px;
   width: 100%;
   border-collapse: collapse;
+}
+.rech-modal .rech-ai-score-note {
+  display: block;
+  margin: 0 0 6px;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.35;
 }
 .rech-modal .rech-ai-score-table th,
 .rech-modal .rech-ai-score-table td {
@@ -7804,9 +10149,36 @@
   text-align: left;
   vertical-align: top;
 }
+.rech-modal .rech-ai-score-table th:first-child,
+.rech-modal .rech-ai-score-table td:first-child {
+  width: 44px;
+  text-align: center;
+}
+.rech-modal .rech-ai-score-table input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
 .rech-modal .rech-ai-table-preview .rech-table-wrap {
-  max-height: 260px;
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  max-height: min(520px, 55vh);
   margin: 6px 0 0;
+  overflow: auto;
+  background: #ffffff;
+  border: 1px solid #dbe3ea;
+  border-radius: 6px;
+}
+.rech-modal .rech-ai-table-preview .rech-result-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+.rech-modal .rech-ai-table-preview .rech-result-table th,
+.rech-modal .rech-ai-table-preview .rech-result-table td {
+  padding: 5px 7px;
+  white-space: nowrap;
 }
 .rech-modal .rech-candidate-panel {
   margin: 8px 0;
@@ -7994,6 +10366,26 @@
   border-radius: 8px;
   box-shadow: 0 10px 34px rgba(16, 24, 40, 0.22);
 }
+.rech-modal.is-attention {
+  animation: rech-modal-attention 0.28s ease-out;
+}
+@keyframes rech-modal-attention {
+  0% {
+    box-shadow: 0 10px 34px rgba(16, 24, 40, 0.22);
+    transform: translateX(0);
+  }
+  35% {
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.22), 0 10px 34px rgba(16, 24, 40, 0.22);
+    transform: translateX(-2px);
+  }
+  70% {
+    transform: translateX(2px);
+  }
+  100% {
+    box-shadow: 0 10px 34px rgba(16, 24, 40, 0.22);
+    transform: translateX(0);
+  }
+}
 .rech-modal-header,
 .rech-modal-footer {
   flex: 0 0 auto;
@@ -8038,6 +10430,53 @@
   background: #ffffff;
   border-color: #cbd5df;
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+}
+.rech-modal .rech-output-templates {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0;
+}
+.rech-modal .rech-output-template-note {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.rech-modal .rech-output-template-list {
+  display: grid;
+  gap: 10px;
+}
+.rech-modal .rech-output-template-item {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid #e1e7ed;
+  border-radius: 6px;
+  background: #f8fafc;
+}
+.rech-modal .rech-output-template-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+.rech-modal .rech-output-template-header input,
+.rech-modal .rech-output-template-item textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #cbd5df;
+  border-radius: 6px;
+  background: #ffffff;
+}
+.rech-modal .rech-output-template-header input {
+  min-height: 30px;
+  padding: 5px 8px;
+}
+.rech-modal .rech-output-template-item textarea {
+  min-height: 96px;
+  padding: 8px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.4;
 }
 .rech-settings-body {
   flex: 1 1 auto;
