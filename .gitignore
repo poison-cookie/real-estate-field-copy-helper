@@ -1,0 +1,35 @@
+# Local work artifacts
+local-artifacts/
+.playwright-mcp/
+pictures/
+
+# Verification screenshots and temporary images
+site-*-table.png
+*-verified.png
+*-resized.png
+*-check.png
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+~$*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+.idea/
+
+# Node/package manager artifacts, if used for local checks
+node_modules/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
