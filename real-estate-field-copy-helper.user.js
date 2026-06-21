@@ -586,7 +586,7 @@
     applyPanelOffset();
   }
 
-  function renderPanel() {
+  function renderPanel(renderOptions) {
     if (!panelRoot) return;
     const collapsed = settings.uiSettings.panelCollapsed;
     panelRoot.classList.toggle("is-collapsed", collapsed);
@@ -647,17 +647,18 @@
     const tableSlot = el("div", "rech-table-slot");
     const anomalySlot = el("div", "rech-anomaly-slot");
     const status = el("div", "rech-status");
+    const tableOptions = getPanelListingTableOptions(renderOptions);
     if (activeTab === "check" && listingRows.length) {
       panelRoot.appendChild(renderPanelKeywordFilter(listingRows, (nextRows) => {
         filteredListingRows = applyPanelListingSort(nextRows);
         tableSlot.innerHTML = "";
-        tableSlot.appendChild(renderListingTable(filteredListingRows, "検索条件に一致する物件がありません", getPanelListingTableOptions()));
+        tableSlot.appendChild(renderListingTable(filteredListingRows, "検索条件に一致する物件がありません", tableOptions));
         anomalySlot.innerHTML = "";
         anomalySlot.appendChild(renderListingAnomalyWarnings(filteredListingRows));
         updatePanelListingStatus(status, listingRows, filteredListingRows);
       }));
-      panelRoot.appendChild(renderPanelValueModeToggle(() => {
-        renderPanel();
+      panelRoot.appendChild(renderPanelValueModeToggle((mode) => {
+        renderPanel({ tableValueMode: mode });
       }));
     }
 
@@ -668,7 +669,7 @@
       panelRoot.appendChild(renderPanelAssistantShortcut());
       status.textContent = "全体、部分、整形、確認、完成の順でAIと表を作ります";
     } else if (listingRows.length) {
-      tableSlot.appendChild(renderListingTable(filteredListingRows, getPanelKeywordFilter() ? "検索条件に一致する物件がありません" : undefined, getPanelListingTableOptions()));
+      tableSlot.appendChild(renderListingTable(filteredListingRows, getPanelKeywordFilter() ? "検索条件に一致する物件がありません" : undefined, tableOptions));
       panelRoot.appendChild(tableSlot);
       anomalySlot.appendChild(renderListingAnomalyWarnings(filteredListingRows));
       panelRoot.appendChild(anomalySlot);
@@ -991,11 +992,11 @@
     saveSettings(settings);
   }
 
-  function getPanelListingTableOptions() {
+  function getPanelListingTableOptions(overrides) {
     return {
       sortable: true,
       sortState: getPanelTableSort(),
-      valueMode: getPanelTableValueMode(),
+      valueMode: overrides && overrides.tableValueMode ? overrides.tableValueMode : getPanelTableValueMode(),
       onSort: (key) => {
         togglePanelTableSort(key);
         renderPanel();
@@ -1010,26 +1011,32 @@
   function renderPanelValueModeToggle(onChange) {
     const wrapper = el("div", "rech-value-mode-toggle");
     wrapper.appendChild(el("span", "", "表示"));
+    const currentMode = getPanelTableValueMode();
     [
       ["normalized", "整形後"],
       ["raw", "取得元"],
     ].forEach(([mode, label]) => {
-      const modeButton = button(label, `rech-secondary rech-mini-button${getPanelTableValueMode() === mode ? " is-active" : ""}`, () => {
-        settings.uiSettings.panelTableValueMode = mode;
+      const modeButton = button(label, `rech-secondary rech-mini-button${currentMode === mode ? " is-active" : ""}`, () => {
+        setPanelTableValueMode(mode);
         saveUiSettingsOnly();
-        if (typeof onChange === "function") onChange();
+        if (typeof onChange === "function") onChange(getPanelTableValueMode());
       });
       modeButton.type = "button";
-      modeButton.setAttribute("aria-pressed", getPanelTableValueMode() === mode ? "true" : "false");
+      modeButton.setAttribute("aria-pressed", currentMode === mode ? "true" : "false");
       modeButton.title = mode === "raw" ? "正規化前に取得した表示へ切り替えます" : "表記ゆれを吸収した表示へ戻します";
       wrapper.appendChild(modeButton);
     });
-    wrapper.appendChild(el("small", "", getPanelTableValueMode() === "raw" ? "取得元表示です。正規化や切り出し前の値を確認できます。" : "整形後表示です。コピーに使う値を確認できます。"));
+    wrapper.appendChild(el("small", "", currentMode === "raw" ? "取得元表示です。正規化や切り出し前の値を確認できます。" : "整形後表示です。コピーに使う値を確認できます。"));
     return wrapper;
   }
 
   function getPanelTableValueMode() {
     return settings.uiSettings && settings.uiSettings.panelTableValueMode === "raw" ? "raw" : "normalized";
+  }
+
+  function setPanelTableValueMode(mode) {
+    if (!settings.uiSettings || typeof settings.uiSettings !== "object") settings.uiSettings = {};
+    settings.uiSettings.panelTableValueMode = mode === "raw" ? "raw" : "normalized";
   }
 
   async function copyListingRowWithTemplate(row, templateEntry) {
@@ -5310,10 +5317,10 @@
   }
 
   function isExpectedAvailableDateValue(value, rawValue) {
-    const text = normalizeNumberText(value);
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
     const raw = normalizeNumberText(rawValue);
     if (hasAnyAiFieldToken(raw, ["money", "area", "layout", "ad"])) return false;
-    return /即|相談|入居|空|予定|[0-9]{4}年|[0-9]{1,2}月|上旬|中旬|下旬/.test(text);
+    return text === "即可" || text === "相談" || /^[0-9]{1,2}月(?:上旬|中旬|下旬)$/.test(text);
   }
 
   function isExpectedAdValue(value, rawValue) {
@@ -7770,9 +7777,29 @@
   }
 
   function normalizeAvailableDateValue(value) {
-    const text = normalizeByGlobalAliases(value);
+    const text = normalizeNumberText(normalizeByGlobalAliases(value)).replace(/\s+/g, "");
     if (!text) return "相談";
-    return text;
+    if (/即可|即入居|即時入居|すぐ入居|即日|即$/.test(text)) return "即可";
+    if (/相談|応相談|要相談|時期未定|未定/.test(text)) return "相談";
+    const monthTiming = text.match(/(?:[0-9]{4}年)?([0-9]{1,2})月(?:[0-9]{1,2}日)?(上旬|中旬|下旬)/);
+    if (monthTiming) return `${Number(monthTiming[1])}月${monthTiming[2]}`;
+    const monthEnd = text.match(/(?:[0-9]{4}年)?([0-9]{1,2})月(?:末|末頃|末予定)/);
+    if (monthEnd) return `${Number(monthEnd[1])}月下旬`;
+    const monthDay = text.match(/(?:[0-9]{4}年)?([0-9]{1,2})月([0-9]{1,2})日/);
+    if (monthDay) {
+      const month = Number(monthDay[1]);
+      const day = Number(monthDay[2]);
+      if (Number.isFinite(month) && Number.isFinite(day)) return `${month}月${getMonthTimingFromDay(day)}`;
+    }
+    const monthOnly = text.match(/(?:[0-9]{4}年)?([0-9]{1,2})月(?:予定|以降|頃|末)?/);
+    if (monthOnly) return `${Number(monthOnly[1])}月中旬`;
+    return "相談";
+  }
+
+  function getMonthTimingFromDay(day) {
+    if (day <= 10) return "上旬";
+    if (day <= 20) return "中旬";
+    return "下旬";
   }
 
   function normalizeRentValue(value) {
