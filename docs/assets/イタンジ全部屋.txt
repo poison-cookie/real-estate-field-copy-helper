@@ -1,0 +1,285 @@
+以下の情報から、抽出設定JSONを作成してください。
+URLは含めていません。body内のHTMLと候補断片を見て、汎用的に繰り返し使える設定を返してください。
+
+{
+  "task": "不動産一覧ページから部屋ごとの表を作るためのCSSセレクタ、正規表現、整形方法を提案してください。",
+  "privacy": "ログインが必要な画面を想定しているため、ページURLは含めていません。HTML内のhref/src/action/data-detailurl、フォーム値、token/key/session系の属性値は伏せています。",
+  "fields": [
+    {
+      "key": "buildingName",
+      "label": "物件名"
+    },
+    {
+      "key": "room",
+      "label": "号室"
+    },
+    {
+      "key": "rent",
+      "label": "賃料"
+    },
+    {
+      "key": "managementFee",
+      "label": "管理費"
+    },
+    {
+      "key": "deposit",
+      "label": "敷金"
+    },
+    {
+      "key": "keyMoney",
+      "label": "礼金"
+    },
+    {
+      "key": "availableDate",
+      "label": "入居日"
+    },
+    {
+      "key": "ad",
+      "label": "AD"
+    },
+    {
+      "key": "layout",
+      "label": "間取り"
+    },
+    {
+      "key": "area",
+      "label": "面積"
+    }
+  ],
+  "outputJsonOnly": true,
+  "expectedResponseShape": {
+    "extractionStrategy": "css / tableExtraction / roomCells のいずれか。混ぜすぎない",
+    "itemSelector": "1物件のまとまりのCSS。不要なら空文字",
+    "rowSelector": "1部屋のまとまりのCSS。不要なら空文字",
+    "tableExtraction": {
+      "enabled": "htmlSnippets.tableCandidatesに適切な表がある場合だけtrue。表でないサイトではfalseまたは省略",
+      "mode": "standard または roomCells",
+      "tableSelector": "対象tableのCSS",
+      "rowSelector": "standardならtr。データ行だけを選べるならそのCSS",
+      "cellSelector": "standardならtd,th",
+      "headerRowIndex": 0,
+      "dataStartRowIndex": 1,
+      "roomSelector": "roomCellsの場合の1部屋セルCSS",
+      "buildingNameSelector": "表外に物件名がある場合だけCSS",
+      "columns": {
+        "room": 0,
+        "layout": 1,
+        "area": 2,
+        "rent": 3,
+        "managementFee": 4,
+        "depositKeyMoney": 5,
+        "availableDate": 6
+      },
+      "excludeColumns": [
+        "備考など表に出さない列"
+      ]
+    },
+    "fields": {
+      "buildingName": {
+        "scope": "item",
+        "selector": "",
+        "selectorCandidates": [],
+        "regex": "",
+        "lineMode": "",
+        "normalizer": "text"
+      },
+      "rent": {
+        "scope": "row",
+        "selector": "",
+        "selectorCandidates": [],
+        "regex": "",
+        "lineMode": "",
+        "normalizer": "rent"
+      },
+      "managementFee": {
+        "scope": "row",
+        "selector": "",
+        "selectorCandidates": [],
+        "regex": "",
+        "lineMode": "",
+        "normalizer": "yen"
+      },
+      "deposit": {
+        "scope": "row",
+        "selector": "",
+        "selectorCandidates": [],
+        "regex": "",
+        "lineMode": "",
+        "normalizer": "rentMonth"
+      },
+      "keyMoney": {
+        "scope": "row",
+        "selector": "",
+        "selectorCandidates": [],
+        "regex": "",
+        "lineMode": "",
+        "normalizer": "rentMonth"
+      },
+      "layout": {
+        "scope": "row",
+        "selector": "",
+        "selectorCandidates": [],
+        "regex": "",
+        "lineMode": "",
+        "normalizer": "layout"
+      },
+      "area": {
+        "scope": "row",
+        "selector": "",
+        "selectorCandidates": [],
+        "regex": "",
+        "lineMode": "",
+        "normalizer": "area"
+      }
+    },
+    "selfCheck": {
+      "expectedRowCount": "この設定で取れると想定する部屋行数",
+      "sampleRows": "想定される先頭数行の値",
+      "uncertainFields": [
+        "自信が低い項目名"
+      ],
+      "reason": "この方式を選んだ理由"
+    }
+  },
+  "rules": [
+    "回答はJSONだけにしてください。説明文やMarkdownコードフェンスは不要です。",
+    "JSONにコメントや末尾カンマを入れないでください。キー名は必ずダブルクォートで囲んでください。",
+    "正規表現のバックスラッシュはJSON文字列として必ずエスケープしてください。例: バックスラッシュ+s は、JSONではバックスラッシュ2本+s で書きます。",
+    "CSS属性セレクタ内の引用符は、[data-testid='value'] のようにシングルクォートを使ってください。JSON文字列を壊すため [data-testid=\"value\"] は避けてください。",
+    "特定の1件だけに依存する長すぎるnth-childは避け、同じ一覧内で繰り返し使えるCSSを優先してください。",
+    "賃料と管理費、間取りと面積が同じセルにある場合は、selectorでセルを指定し、regexまたはlineModeで切り分けてください。",
+    "ADは、AD、広告料、広告費などと明記されている場合だけ設定してください。仲介手数料、家賃の55%、手数料割引、タグ表示はADではありません。AD/広告表記がなければ未記載にしてください。",
+    "scopeは item, row, document のいずれかにしてください。基本は物件名がitem、部屋項目がrowです。",
+    "selectorに自信がない項目はselectorCandidatesに複数候補を入れてください。ツール側で先頭を主候補、残りを予備候補として検証します。",
+    "広すぎるセレクタ、取得0件になりそうなセレクタ、nth-childだらけのセレクタは避けてください。",
+    "extractionStrategyは css / tableExtraction / roomCells のどれか1つを主方式として選んでください。表が十分ならtableExtractionまたはroomCells、表でなければcssを選んでください。",
+    "htmlSnippets.fieldValueCandidatesの候補値と、実際に返すselector/regexで取れる値が矛盾しないようにしてください。",
+    "selfCheckに想定行数、サンプル値、不安な項目を入れてください。ツール側で検証します。",
+    "号室には階数だけを入れないでください。部屋番号がない一般サイトでは空欄または取得不能として扱ってください。",
+    "htmlSnippets.tableCandidatesに部屋一覧として使える表がある場合は、CSS fieldsよりtableExtractionを優先してください。ただし表ではないサイトではtableExtractionを使わないでください。",
+    "通常のHTMLテーブルで1行が1部屋なら mode は standard、td.roomなど1セルが1部屋なら mode は roomCells にしてください。",
+    "敷金/礼金が1セルの場合は columns.depositKeyMoney に列番号またはセル指定を入れてください。備考列は excludeColumns に入れ、コピー対象にはしないでください。",
+    "sanitizedBodyHtmlでは検索フォーム、ナビゲーション、入力部品、操作ボタンをできるだけ除外しています。部屋情報がある場合は削りすぎないように残していることがあります。",
+    "htmlSnippets.roomCandidates / repeatingGroups / fieldEvidence を優先して見てください。itemCandidates や sanitizedBodyHtml に検索フォームが残る場合があります。"
+  ],
+  "currentConfig": {
+    "itemSelector": "",
+    "rowSelector": "div.itandi-bb-ui__Box.css-809md5",
+    "scopeMode": "mixed",
+    "tableExtraction": {
+      "enabled": false,
+      "mode": "standard",
+      "tableSelector": "",
+      "rowSelector": "tr",
+      "cellSelector": "td,th",
+      "dataStartRowIndex": 1,
+      "roomSelector": "",
+      "buildingNameSelector": "",
+      "columns": {},
+      "excludeColumns": []
+    },
+    "fields": {
+      "buildingName": {
+        "scope": "document",
+        "selector": ".css-17n5ssh > div:first-child",
+        "lineMode": "",
+        "normalizer": "text",
+        "regex": ""
+      },
+      "room": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption) > .css-1n64r3q-Attributes > span:nth-child(1) > span.css-v8yloo-PrimaryText",
+        "lineMode": "",
+        "normalizer": "text",
+        "regex": "^\\s*([0-9A-Za-z\\-]+(?:号室)?)\\s*$"
+      },
+      "rent": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption:contains('賃管共')) .css-1n64r3q-Attributes",
+        "lineMode": "",
+        "normalizer": "rent",
+        "regex": "([0-9.]+万円)"
+      },
+      "managementFee": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption:contains('賃管共')) .css-1n64r3q-Attributes",
+        "lineMode": "",
+        "normalizer": "yen",
+        "regex": "(?:[0-9.]+万円)\\s*/\\s*([0-9,]+円|なし)"
+      },
+      "deposit": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption:contains('敷礼保')) .css-1n64r3q-Attributes",
+        "lineMode": "",
+        "normalizer": "rentMonth",
+        "regex": "^\\s*([^/]+)"
+      },
+      "keyMoney": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption:contains('敷礼保')) .css-1n64r3q-Attributes",
+        "lineMode": "",
+        "normalizer": "text",
+        "regex": "^[^/]+\\s*/\\s*(なし|[0-9.,]+ヶ月|[0-9,]+円)"
+      },
+      "availableDate": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption:contains('内見・申込')) .css-1vgpfon-Attributes-AttributesDirectionColumn",
+        "lineMode": "",
+        "normalizer": "availableDate",
+        "regex": "入居：\\s*([^\n]+)"
+      },
+      "ad": {
+        "scope": "row",
+        "selector": ".css-yj0ebl",
+        "lineMode": "",
+        "normalizer": "ad",
+        "regex": "(AD|広告料|広告費)\\s*([^\\s]+)?"
+      },
+      "layout": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption:contains('間取り')) .css-1svq3u4-Attributes-AttributesDirectionRowSeparateSpace",
+        "lineMode": "",
+        "normalizer": "layout",
+        "regex": "^\\s*([0-9SLDKR+]+)"
+      },
+      "area": {
+        "scope": "row",
+        "selector": "div:has(> .css-ciczvz-Caption:contains('間取り')) .css-1svq3u4-Attributes-AttributesDirectionRowSeparateSpace",
+        "lineMode": "",
+        "normalizer": "area",
+        "regex": "([0-9.]+㎡)"
+      }
+    }
+  },
+  "htmlSnippets": {
+    "copyDiagnostics": {
+      "bodyTextLength": 4882,
+      "configuredItemSelector": "",
+      "configuredItemCount": 0,
+      "configuredRowSelector": "div.itandi-bb-ui__Box.css-809md5",
+      "configuredRowCount": 8,
+      "roomCandidateCount": 12,
+      "totalRoomCandidateCount": 91,
+      "omittedRoomCandidateCount": 79,
+      "inferredRoomCandidateCount": 91,
+      "tableCandidateCount": 0,
+      "warnings": [
+        "1物件候補に検索フォーム/絞り込みUIが混ざっている可能性があります。roomCandidatesを優先してください。",
+        "部屋候補は推定91件ありますが、AIへは上位12件だけ渡しています。"
+      ]
+    },
+    "tableCandidates": [],
+    "itemCandidates": [
+      {
+        "index": 1,
+        "tag": "div",
+        "id": "",
+        "className": "ListContainer",
+        "stableCssPath": "#root > div.itandi-bb-ui__Grid > div.ListContainer",
+        "candidateSelectors": [
+          "div.ListContainer",
+          ".ListContainer",
+          "#root > div.itandi-bb-ui__Grid > div.ListContainer"
+        ],
+        "textPreview": "条件呼び出し 条件保存 物件名（カナ検索可） ​ 部屋番号 ​ 管理会社 管理会社名を入力 賃料 〜 万円 check_box_outline_blank 管理費・共益費込み check_box_outline_blank 敷金なし check_box_outline_blank 礼金なし 所在地 所在地で絞り込み 路線・駅 路線・駅で絞り込み 駅徒歩 分以内 check_box_outline_blank バス乗車時間を含む 募集条件更新 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 日以内 専有面積 〜 ㎡ 広告費 check_box_outline_blank 広告費あり 広告掲載可否 check_box_outline_blank 可能 check_box_outline_blank 要連絡 取引態様 貸主 代理 専属専任媒介 専任媒介 一般媒介 築年数 年以内 建物種別 マンション アパート 一戸建て テラスハウス タウンハウス シェアハウス 間取り check_box_outline_blank 1R check_box_outline_blank 1K check_box_outline_blank 1DK check_box_outline_blank 1LDK check_box_outline_blank 2K check_box_outline_blank 2DK check_box_outli\n...[truncated 3904 chars]...\n物確不要 7日以上前 803 13.5万円 15,000円 入力なし なし なし 入力なし 1K 25.32㎡ 即内見可 相談 10枚 1ヶ月 貸主 可 内見 WEB 0 図面 物件資料 詳細 check_box_outline_blank 申込あり 物確不要 3日前 1004 13.7万円 15,000円 入力なし なし なし 入力なし 1K 25.32㎡ 即内見可 即入居可 10枚 2ヶ月 貸主 可 内見 WEB 1 図面 物件資料 詳細 check_box_outline_blank すべて選択 0件選択中 まとめて 図面 ＤＬ",
+        "html": "<div class=\"ListContainer\"><div class=\"MuiDrawer-root MuiDrawer-docked css-1tu59u4\"><div class=\"MuiPaper-root MuiPaper-elevation MuiPaper-elevation0 MuiDraw

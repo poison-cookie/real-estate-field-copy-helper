@@ -37,7 +37,7 @@
   ];
   const DEFAULT_VALUE_ALIASES = [
     { output: "即可", aliases: ["即入居可", "即入居", "即時入居可", "すぐ入居可"] },
-    { output: "0ヶ月", aliases: ["", "なし", "無し", "無", "無料", "不要", "-"] },
+    { output: "0ヶ月", aliases: ["", "なし", "無し", "無", "無料", "不要", "入力なし", "未入力", "設定なし", "-"] },
   ];
   const DEFAULT_PANEL_WIDTH = 760;
   const DEFAULT_PANEL_HEIGHT = 620;
@@ -3579,10 +3579,13 @@
         },
         fields: {
           buildingName: { scope: "item", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "text" },
+          room: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "text" },
           rent: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "rent" },
           managementFee: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "yen" },
           deposit: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "rentMonth" },
           keyMoney: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "rentMonth" },
+          availableDate: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "availableDate" },
+          ad: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "ad" },
           layout: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "layout" },
           area: { scope: "row", selector: "", selectorCandidates: [], regex: "", lineMode: "", normalizer: "area" },
         },
@@ -3613,7 +3616,23 @@
         "敷金/礼金が1セルの場合は columns.depositKeyMoney に列番号またはセル指定を入れてください。備考列は excludeColumns に入れ、コピー対象にはしないでください。",
         "sanitizedBodyHtmlでは検索フォーム、ナビゲーション、入力部品、操作ボタンをできるだけ除外しています。部屋情報がある場合は削りすぎないように残していることがあります。",
         "htmlSnippets.roomCandidates / repeatingGroups / fieldEvidence を優先して見てください。itemCandidates や sanitizedBodyHtml に検索フォームが残る場合があります。",
+        "React/MUI系の画面では .css-xxxx のような生成クラスは変わりやすいため、単独の根拠にしないでください。rowSelectorは繰り返し構造、fieldsはrow内テキストへのregexを優先してください。",
+        ":contains() は標準CSSではないため絶対に使わないでください。ラベル文字を使いたい場合は scope=row、selector=\"\"、regexでrowTextから切り出してください。",
+        "htmlSnippets.roomTextRows は、1部屋ごとの表示テキストとツール側推定値です。イタンジのようなdiv一覧ではこの情報を最優先にしてください。",
+        "敷金と礼金は同じrowText内の連続値として扱ってください。片方だけ別CSSにするとズレやすいので、原則としてdeposit/keyMoneyは同じscope=row、selector=\"\"、それぞれregexで切り分けてください。",
+        "イタンジの 入力なし は敷金/礼金では 0ヶ月 として扱ってください。",
       ],
+      priorityInstructions: [
+        "まず htmlSnippets.roomTextRows と fieldValueCandidates で、1部屋の繰り返し単位と値の並びを確認してください。",
+        "通常tableでなければ tableExtraction は使わず extractionStrategy=css にしてください。",
+        "生成クラスしかない項目は、field.selectorを空文字にしてrowText全体へregexをかける設定を優先してください。",
+        "敷金/礼金は htmlSnippets.roomTextRows[].leaseCostPair.tokens の順番と guessed.deposit/keyMoney を照合して、同じ根拠から切り出してください。",
+      ],
+      selectorConstraints: {
+        forbidden: [":contains()", "URLやtoken等の秘匿属性", "1件だけに依存する長いnth-child"],
+        unstableUnlessBackedByRows: [".css-xxxx", ".Mui-xxxx", "emotion/styled-components由来の生成クラス"],
+        robustForItandiLikeScreens: ["rowSelectorで1部屋ブロックを取る", "selector=\"\" + scope=row + regexでrowTextから切る", "fieldValueCandidatesの値とプレビュー行を照合する"],
+      },
       currentConfig: serializeAiRelevantListingConfig(config),
       htmlSnippets: snippets,
       copySummary: {
@@ -3623,6 +3642,7 @@
         includedTableCandidateCount: snippets.tableCandidates ? snippets.tableCandidates.length : 0,
         includedRepeatingGroupCount: snippets.repeatingGroups ? snippets.repeatingGroups.length : 0,
         includedFieldEvidenceCount: snippets.fieldEvidence ? snippets.fieldEvidence.length : 0,
+        includedRoomTextRowCount: snippets.roomTextRows ? snippets.roomTextRows.length : 0,
         sanitizedBodyHtmlLength: sanitizedBodyHtml.length,
         note: "イタンジ等で一覧表示/もっと見るを押した後は、再スキャンして候補数が増えた状態でコピーしてください。",
       },
@@ -3690,9 +3710,10 @@
     return {
       copyDiagnostics: buildAiCopyDiagnostics(config, itemNodes, roomNodes, inferredRoomNodes, allRoomNodes, tableCandidates),
       tableCandidates,
-      itemCandidates: itemNodes.map((node, index) => getAiSnippetEntry(node, index + 1, { htmlLimit: 9000, textLimit: 900 })),
+      itemCandidates: itemNodes.map((node, index) => getAiSnippetEntry(node, index + 1, { htmlLimit: 3500, textLimit: 600 })),
+      roomTextRows: getAiRoomTextRows(allRoomNodes),
       roomCandidates: roomNodes.map((node, index) => ({
-        ...getAiSnippetEntry(node, index + 1, { htmlLimit: 12000, textLimit: 1400 }),
+        ...getAiSnippetEntry(node, index + 1, { htmlLimit: 5500, textLimit: 900 }),
         score: scoreAiRoomCandidate(node),
         diagnostics: summarizeAiRoomCandidate(node),
       })),
@@ -3700,6 +3721,39 @@
       fieldEvidence: getAiFieldEvidenceSnippets(config, roomNodes),
       fieldValueCandidates: getAiFieldValueCandidateLists(allRoomNodes),
     };
+  }
+
+  function getAiRoomTextRows(roomNodes) {
+    return (roomNodes || []).slice(0, 24).map((node, index) => {
+      const text = normalizeNumberText(node && (node.innerText || node.textContent) || "");
+      const rent = extractRentFromText(text);
+      const leasePair = extractLeaseCostPairFromText(text);
+      return {
+        index: index + 1,
+        candidateSelectors: buildAiCandidateSelectors(node).slice(0, 4),
+        text: truncateText(text, 900),
+        guessed: {
+          room: getSpecificRoomIdentifier(text),
+          rent: normalizeConfiguredValue(rent, "rent", "rent"),
+          managementFee: normalizeConfiguredValue(extractManagementFeeFromText(text, rent), "yen", "managementFee"),
+          deposit: normalizeLeaseCostCandidate(leasePair.deposit, rent),
+          keyMoney: normalizeLeaseCostCandidate(leasePair.keyMoney, rent),
+          layout: normalizeConfiguredValue(extractLayoutFromText(text), "layout", "layout"),
+          area: normalizeConfiguredValue(extractAreaFromText(text), "area", "area"),
+          availableDate: normalizeConfiguredValue(guessAiFieldEvidenceValue("availableDate", text), "availableDate", "availableDate"),
+          ad: normalizeConfiguredValue(guessAiFieldEvidenceValue("ad", text), "ad", "ad"),
+        },
+        leaseCostPair: {
+          source: leasePair.source,
+          tokens: leasePair.tokens,
+          raw: leasePair.raw,
+        },
+      };
+    });
+  }
+
+  function normalizeLeaseCostCandidate(value, rentValue) {
+    return value ? normalizeLeaseCostByRent(value, rentValue, "rentMonth") : "";
   }
 
   function getAiTableCandidateSnippets() {
@@ -4082,12 +4136,14 @@
     };
     nodes.forEach((node, nodeIndex) => {
       const rawText = normalizeNumberText(node && (node.innerText || node.textContent) || "");
+      const rent = extractRentFromText(rawText);
+      const leasePair = extractLeaseCostPairFromText(rawText);
       const guesses = {
         room: guessAiFieldEvidenceValue("room", rawText) || getSpecificRoomIdentifier(rawText),
-        rent: normalizeConfiguredValue(extractRentFromText(rawText), "rent", "rent"),
-        managementFee: normalizeConfiguredValue(extractManagementFeeFromText(rawText, extractRentFromText(rawText)), "yen", "managementFee"),
-        deposit: normalizeLeaseCostByRent(extractDepositFromText(rawText), extractRentFromText(rawText), "rentMonth"),
-        keyMoney: normalizeLeaseCostByRent(extractKeyMoneyFromText(rawText), extractRentFromText(rawText), "rentMonth"),
+        rent: normalizeConfiguredValue(rent, "rent", "rent"),
+        managementFee: normalizeConfiguredValue(extractManagementFeeFromText(rawText, rent), "yen", "managementFee"),
+        deposit: normalizeLeaseCostCandidate(leasePair.deposit, rent),
+        keyMoney: normalizeLeaseCostCandidate(leasePair.keyMoney, rent),
         availableDate: guessAiFieldEvidenceValue("availableDate", rawText),
         ad: guessAiFieldEvidenceValue("ad", rawText),
         layout: normalizeConfiguredValue(extractLayoutFromText(rawText), "layout", "layout"),
@@ -4584,10 +4640,14 @@
         selectorRule.scope = normalizeListingScope(spec.scope, getDefaultListingScope(key, config));
         regexRule.scope = toListingTextScope(selectorRule.scope);
       }
-      const selector = getFirstAiString(spec.selector || spec.css || spec.cssSelector || spec.valueSelector || spec.selectorCandidates, report, getListingFieldLabel(key));
+      const selector = getFirstAiString(getAiPrimarySelectorValue(spec), report, getListingFieldLabel(key));
       if (typeof selector === "string") {
         selectorRule.selector = selector.trim();
         selectorRule.attribute = spec.attribute || selectorRule.attribute || "text";
+        selectorRule.aiManaged = true;
+      } else if ((spec.regex || spec.pattern) && isAiRowTextRegexSpec(spec)) {
+        selectorRule.selector = "";
+        selectorRule.attribute = "text";
         selectorRule.aiManaged = true;
       }
       getAiSelectorCandidates(spec).slice(1, 4).forEach((candidate) => {
@@ -4788,6 +4848,19 @@
     if (spec.captureGroup != null && spec.group == null) spec.group = spec.captureGroup;
     if (spec.line_mode && !spec.lineMode) spec.lineMode = spec.line_mode;
     return spec;
+  }
+
+  function isAiRowTextRegexSpec(spec) {
+    const scope = normalizeListingScope(spec && spec.scope || "row", "row");
+    return scope === "row" || scope === "document";
+  }
+
+  function getAiPrimarySelectorValue(spec) {
+    if (!spec || typeof spec !== "object") return undefined;
+    for (const key of ["selector", "css", "cssSelector", "valueSelector", "selectorCandidates"]) {
+      if (Object.prototype.hasOwnProperty.call(spec, key)) return spec[key];
+    }
+    return undefined;
   }
 
   function getFirstAiString(value, report, label) {
@@ -4991,6 +5064,11 @@
 
   function validateSelectorForAiReview(selector, label, report) {
     if (!selector) return;
+    const unsupportedReason = getUnsupportedSelectorReason(selector);
+    if (unsupportedReason) {
+      report.errors.push(`${label} のCSSセレクタは使えません: ${unsupportedReason} / ${selector}`);
+      return;
+    }
     if (!isSelectorValidForPreview(selector)) {
       report.errors.push(`${label} のCSSセレクタが不正です: ${selector}`);
     }
@@ -5004,9 +5082,26 @@
     if (selector.length > 180) {
       report.warnings.push(`${label} のCSSが長すぎます。安定したclassやdata属性に短縮できるか確認してください。`);
     }
+    if (isGeneratedClassHeavySelector(selector)) {
+      report.warnings.push(`${label} は生成クラスへの依存が強く、React/MUI系サイトで壊れやすい可能性があります。rowTextへの正規表現も検討してください: ${truncateText(selector, 100)}`);
+    }
     if (/^\.?[a-z0-9_-]+$/i.test(selector) && countSelectorForAiReview(selector, document) > 80) {
       report.warnings.push(`${label} のCSSが広すぎる可能性があります: ${selector}`);
     }
+  }
+
+  function getUnsupportedSelectorReason(selector) {
+    const text = String(selector || "");
+    if (/:contains\s*\(/i.test(text)) return ":contains() はquerySelectorで使えないため";
+    return "";
+  }
+
+  function isGeneratedClassHeavySelector(selector) {
+    const text = String(selector || "");
+    const generatedCount = (text.match(/\.(?:css|Mui|sc|emotion|Styled)[A-Za-z0-9_-]*/g) || []).length;
+    if (!generatedCount) return false;
+    const stableSignals = (text.match(/\[data-|#|\.ListContainer|\.itandi-bb-ui__/g) || []).length;
+    return generatedCount >= 2 || generatedCount >= 1 && !stableSignals;
   }
 
   function countSelectorForAiReview(selector, scope) {
@@ -6256,6 +6351,7 @@
   }
 
   function isSelectorValidForPreview(selector) {
+    if (getUnsupportedSelectorReason(selector)) return false;
     try {
       document.createDocumentFragment().querySelector(selector);
       return true;
@@ -7183,6 +7279,7 @@
     if (!text) return;
     if (!values.rent) values.rent = normalizeConfiguredValue(extractRentFromText(text), "rent", "rent");
     if (!values.managementFee) values.managementFee = normalizeConfiguredValue(extractManagementFeeFromText(text, values.rent), "yen", "managementFee");
+    reconcileLeaseCostPairValues(null, values, rawValues, text);
     if (!values.layout) values.layout = normalizeConfiguredValue(extractLayoutFromText(text), "layout", "layout");
     if (!values.area) values.area = normalizeConfiguredValue(extractAreaFromText(text), "area", "area");
     if (!values.room) {
@@ -7190,6 +7287,30 @@
       values.room = labeled ? normalizeText(labeled[1]) : "";
     }
     if (!rawValues.rowText) rawValues.rowText = truncateText(text, 500);
+  }
+
+  function reconcileLeaseCostPairValues(config, values, rawValues, rowText) {
+    const text = normalizeNumberText(rowText || "");
+    if (!text) return;
+    const pair = extractLeaseCostPairFromText(text);
+    if (!pair.deposit && !pair.keyMoney) return;
+    const rent = values.rent || normalizeConfiguredValue(extractRentFromText(text), "rent", "rent");
+    const deposit = normalizeLeaseCostCandidate(pair.deposit, rent);
+    const keyMoney = normalizeLeaseCostCandidate(pair.keyMoney, rent);
+    if (!deposit && !keyMoney) return;
+    const sameRawBlock = Boolean(rawValues.deposit && rawValues.keyMoney && rawValues.deposit === rawValues.keyMoney);
+    const sameCurrentValue = Boolean(values.deposit && values.keyMoney && values.deposit === values.keyMoney);
+    const depositInvalid = values.deposit && !isExpectedLeaseCostValue(values.deposit, rawValues.deposit || text);
+    const keyMoneyInvalid = values.keyMoney && !isExpectedLeaseCostValue(values.keyMoney, rawValues.keyMoney || text);
+    if (deposit && (!values.deposit || sameRawBlock || sameCurrentValue && keyMoney && deposit !== keyMoney || depositInvalid)) {
+      values.deposit = normalizeLeaseCostByRent(deposit, rent, getConfiguredFieldNormalizer(config, "deposit"));
+      rawValues.depositPair = pair.raw || rawValues.depositPair || truncateText(text, 240);
+    }
+    if (keyMoney && (!values.keyMoney || sameRawBlock || sameCurrentValue && deposit && deposit !== keyMoney || keyMoneyInvalid)) {
+      values.keyMoney = normalizeLeaseCostByRent(keyMoney, rent, getConfiguredFieldNormalizer(config, "keyMoney"));
+      rawValues.keyMoneyPair = pair.raw || rawValues.keyMoneyPair || truncateText(text, 240);
+    }
+    if (!rawValues.depositKeyMoney) rawValues.depositKeyMoney = pair.raw || truncateText(text, 240);
   }
 
   function hasMeaningfulTableRow(row) {
@@ -7228,11 +7349,12 @@
         });
 
         applyConfiguredSplitRules(config, context, values);
+        reconcileLeaseCostPairValues(config, values, rawValues, getConfiguredScopeText("rowText", context));
         const emptyReasons = buildConfiguredEmptyReasons(config, context, values);
 
         const buildingName = cleanConfiguredBuildingName(values.buildingName || "");
         const rentValue = values.rent || "";
-        const roomValue = values.room || extractFloorFromText(getConfiguredScopeText("rowText", context));
+        const roomValue = values.room || getSpecificRoomIdentifier(getConfiguredScopeText("rowText", context));
         const rowUrl = getFirstUrl(row);
         const itemUrl = getFirstUrl(item);
         const rowIdentityText = normalizeText(row && (row.innerText || row.textContent) || "");
@@ -7920,16 +8042,61 @@
   }
 
   function extractDepositFromText(value) {
-    return extractLabeledLeaseCost(value, ["敷金", "敷"]) || extractSequentialLeaseCost(value, 0);
+    const pair = extractLeaseCostPairFromText(value);
+    return pair.deposit || extractLabeledLeaseCost(value, ["敷金", "敷"]) || extractSequentialLeaseCost(value, 0);
   }
 
   function extractKeyMoneyFromText(value) {
-    return extractLabeledLeaseCost(value, ["礼金", "礼"]) || extractSequentialLeaseCost(value, 1);
+    const pair = extractLeaseCostPairFromText(value);
+    return pair.keyMoney || extractLabeledLeaseCost(value, ["礼金", "礼"]) || extractSequentialLeaseCost(value, 1);
+  }
+
+  function extractLeaseCostPairFromText(value) {
+    const text = normalizeNumberText(value);
+    if (!text) return createEmptyLeaseCostPair();
+    const labeled = extractLabeledLeaseCostPair(text);
+    if (labeled.deposit || labeled.keyMoney) return labeled;
+    return extractSequentialLeaseCostPair(text);
+  }
+
+  function createEmptyLeaseCostPair() {
+    return { deposit: "", keyMoney: "", tokens: [], source: "", raw: "" };
+  }
+
+  function extractLabeledLeaseCostPair(text) {
+    const deposit = extractLabeledLeaseCost(text, ["敷金", "敷"]);
+    const keyMoney = extractLabeledLeaseCost(text, ["礼金", "礼"]);
+    if (!deposit && !keyMoney) return createEmptyLeaseCostPair();
+    return {
+      deposit,
+      keyMoney,
+      tokens: [deposit, keyMoney].filter(Boolean),
+      source: "labeled",
+      raw: truncateText(text, 240),
+    };
+  }
+
+  function extractSequentialLeaseCostPair(text) {
+    const rentMatch = findRentMoneyMatch(text);
+    if (!rentMatch) return createEmptyLeaseCostPair();
+    const layoutMatch = text.slice(rentMatch.index).match(/[0-9]+\s*(?:SLDK|LDK|SDK|DK|SK|R|K)(?![A-Z])|ワンルーム/i);
+    const endIndex = layoutMatch ? rentMatch.index + layoutMatch.index : rentMatch.index + 180;
+    const afterRent = text.slice(rentMatch.index + rentMatch.value.length, endIndex);
+    const fee = afterRent.match(getManagementFeeTokenRegex());
+    const afterFee = fee ? afterRent.slice(fee.index + fee[0].length) : afterRent;
+    const tokens = extractLeaseCostTokens(afterFee);
+    return {
+      deposit: tokens[0] || "",
+      keyMoney: tokens[1] || "",
+      tokens,
+      source: tokens.length ? "sequentialAfterRentFee" : "",
+      raw: truncateText(afterFee, 240),
+    };
   }
 
   function extractLabeledLeaseCost(value, labels) {
     const text = normalizeNumberText(value);
-    const valuePattern = "(無料|なし|無し|不要|ゼロ|相談|-|[0-9]+(?:\\.[0-9]+)?\\s*(?:ヶ月|か月|ヵ月|カ月|ケ月|万(?:円)?|円)?)";
+    const valuePattern = getLeaseCostTokenPattern();
     for (const label of labels) {
       const regex = new RegExp(`${escapeRegExp(label)}\\s*[:：]?\\s*${valuePattern}`);
       const match = text.match(regex);
@@ -7945,12 +8112,25 @@
     const layoutMatch = text.slice(rentMatch.index).match(/[0-9]+\s*(?:SLDK|LDK|SDK|DK|SK|R|K)(?![A-Z])|ワンルーム/i);
     const endIndex = layoutMatch ? rentMatch.index + layoutMatch.index : rentMatch.index + 160;
     const afterRent = text.slice(rentMatch.index + rentMatch.value.length, endIndex);
-    const fee = afterRent.match(/[0-9][0-9,]*\s*円|無料|なし|無し|不要|込|込み|-/);
+    const fee = afterRent.match(getManagementFeeTokenRegex());
     const afterFee = fee ? afterRent.slice(fee.index + fee[0].length) : afterRent;
-    const tokens = Array.from(afterFee.matchAll(/無料|なし|無し|不要|ゼロ|相談|-|[0-9]+(?:\.[0-9]+)?\s*(?:ヶ月|か月|ヵ月|カ月|ケ月|万(?:円)?|円)/g))
-      .map((match) => match[0])
-      .filter(Boolean);
+    const tokens = extractLeaseCostTokens(afterFee);
     return tokens[index] || "";
+  }
+
+  function extractLeaseCostTokens(text) {
+    return Array.from(normalizeNumberText(text).matchAll(new RegExp(getLeaseCostTokenPattern(), "g")))
+      .map((match) => match[0])
+      .filter(Boolean)
+      .slice(0, 6);
+  }
+
+  function getLeaseCostTokenPattern() {
+    return "入力なし|未入力|設定なし|無料|なし|無し|不要|ゼロ|相談|-|[0-9]+(?:\\.[0-9]+)?\\s*(?:ヶ月|か月|ヵ月|カ月|ケ月|万(?:円)?|円)?";
+  }
+
+  function getManagementFeeTokenRegex() {
+    return /[0-9][0-9,]*\s*円|無料|なし|無し|不要|入力なし|未入力|設定なし|込|込み|-/;
   }
 
   function findRentMoneyMatch(text, rentValue) {
@@ -8955,6 +9135,8 @@
   function normalizeMonth(value) {
     const result = String(value || "").trim();
     if (!result) return "";
+    const emptyLike = normalizeEmptyLikeLeaseCost(result);
+    if (emptyLike) return emptyLike;
     const aliased = normalizeByGlobalAliases(result);
     if (aliased !== result) return aliased;
     if (/^相談$/.test(result)) return result;
@@ -8969,6 +9151,8 @@
     if (normalizer === "text") return result;
     if (normalizer === "yen") return normalizeYenValue(result);
     if (normalizer !== "rentMonth") return normalizeMonth(result);
+    const emptyLike = normalizeEmptyLikeLeaseCost(result);
+    if (emptyLike) return emptyLike;
     const aliased = normalizeByGlobalAliases(result);
     if (aliased !== result) return aliased;
     if (/相談/.test(result)) return result;
@@ -8982,6 +9166,11 @@
     const leaseCostYen = parseLeaseCostAmountForRentMonth(result, rentYen);
     if (rentYen && leaseCostYen != null) return formatRentMonthRatio(leaseCostYen / rentYen);
     return normalizeMonth(result);
+  }
+
+  function normalizeEmptyLikeLeaseCost(value) {
+    const text = normalizeNumberText(value).replace(/\s+/g, "");
+    return /^(入力なし|未入力|設定なし|なし|無し|無|無料|不要|ゼロ|-|0|0円|0ヶ月)$/.test(text) ? "0ヶ月" : "";
   }
 
   function parseLeaseCostAmountForRentMonth(value, rentYen) {
